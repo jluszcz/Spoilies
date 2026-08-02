@@ -24,6 +24,24 @@ A Rust backend on AWS, API-first, with clients (web, native) to follow.
 Designed to idle at effectively $0 and stay private by default: no public discussion, no
 discovery, and no way to see posts from people you have not explicitly grouped with.
 
+## Development
+
+```sh
+cargo build
+cargo test
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+pre-commit run --all-files    # includes cargo fmt --check
+```
+
+CI is a thin caller of `jluszcz/github-utils/.github/workflows/rust-ci.yml@v1`, which runs
+build, test, `cargo fmt --check`, and `cargo clippy --all-targets -- -D warnings` on
+`ubuntu-24.04-arm` against the `aarch64-unknown-linux-musl` target — the Lambda runtime the
+service deploys to. To reproduce a CI failure exactly, append `--target
+aarch64-unknown-linux-musl` to the commands above.
+
+There is no packaging or deployment yet; those land with the implementation.
+
 ## Prior art
 
 [Outwatch](https://github.com/jluszcz/Outwatch) is a Cloudflare Worker tracking which
