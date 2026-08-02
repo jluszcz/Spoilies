@@ -212,39 +212,63 @@ complex discussion read stays one query.
 account            cognito_sub, email, display_name,
                    show_unrevealed_titles, show_note_counts
 group              name, created_by
-membership         group_id, account_id, display_name, accent_color, sort_order
-watch_party        group_id, name
-watch_party_member watch_party_id, membership_id, sharing_enabled
+membership         group_id, account_id, display_name, accent_color, sort_order, left_at
+watch_party        name
+watch_party_member watch_party_id, account_id, sharing_enabled
 invite             group_id, token, created_by, expires_at, max_uses, uses, revoked_at
 
 title              tmdb_id, name, poster_path, status, tmdb_synced_at
 episode            title_id, season_number, episode_number, name, air_date, still_path
 group_title        group_id, title_id
 
-post               group_id, episode_id, membership_id, author_account_id,
+post               episode_id, author_account_id, group_id (nullable),
                    body, created_at, edited_at, offset_secs, reply_to_post_id
-reaction           post_id, account_id, emoji
-reveal             membership_id, episode_id, mode, created_at
-watched_episode    membership_id, episode_id, created_at
-watch_session      membership_id, episode_id, elapsed_secs, running_since, last_activity_at
-watch_offset       membership_id, episode_id, adjust_secs
+reaction           post_id, group_id, account_id, emoji
+reveal             account_id, episode_id, mode, created_at
+watched_episode    account_id, episode_id, created_at
+watch_session      account_id, episode_id, elapsed_secs, running_since, last_activity_at
+watch_offset       account_id, episode_id, adjust_secs
 ```
 
-All tables carry a UUID primary key. `group_id` is denormalised onto `post` so the hot read
-is a single indexed scan rather than a join through `episode → title → group_title`.
+All tables carry a UUID primary key.
+
+### The layering rule
+
+Every table sits at exactly one of two layers, and the layer follows from a single question:
+**does this describe the person, or the person's presence in one group?**
+
+| Layer | Keyed on | Holds |
+| --- | --- | --- |
+| **Account** | `account_id` | Everything about watching: progress, reveals, timers, offsets. Authored posts. Spoiler-display preferences. Watch parties. |
+| **Membership** | `group_id` + `account_id` | Presentation only: display name, accent colour, sort order. Plus group-scoped conversation — replies and reactions. |
+
+You watch an episode once, so watching is account-level. You may present differently to your
+roommates than to your coworkers, so presentation is membership-level.
+
+**Mismatched layers are what produced the redundancy this design originally had.** Keying
+progress on `membership_id` meant somebody in three *Star Trek* groups marked each episode
+watched three times, and could hold "revealed" in one group and "hidden" in another for an
+episode they had watched exactly once. When adding a layer, check it against the question above.
 
 ### Membership, and the watch party
 
-`account` is a login. `membership` is that account's presence in one group, and is the home
-of **all per-group preferences** (display name override, accent colour, sort order).
+`account` is a login. `membership` is that account's presence in one group, and holds only
+presentation: display name override, accent colour, sort order.
 
-A `watch_party` is a persistent set of memberships who watch together on the same screen —
+A `watch_party` is a persistent set of accounts who watch together on the same screen —
 couples, roommates, families. **Up to 10 members**, enforced in the app layer.
 
-**Progress is always per-membership.** Sharing is a *write-time fan-out*, not a shared row:
+**A watch party is account-level, not group-scoped.** Your household is your household
+regardless of which group you are looking at. Scoping parties to groups would break under
+account-level progress: somebody in a roommate party in one group and a partner party in
+another would have a single solo viewing fan out to both, claiming two households watched
+an episode when one person did. A party renders inside any group's grid as one column
+merging whichever of its members belong to that group.
 
-> A write from membership X propagates to the other members of X's watch party **only if X
-> is sharing**, and **only to members who are themselves sharing**.
+**Progress is always per-account.** Sharing is a *write-time fan-out*, not a shared row:
+
+> A write from account X propagates to the other members of X's watch party **only if X is
+> sharing**, and **only to members who are themselves sharing**.
 
 `watch_party_member.sharing_enabled` defaults to true. Flipping it off is symmetric — the
 traveller stops broadcasting and stops receiving in one action, and everyone else stays in
@@ -255,15 +279,22 @@ size 9, one roommate on a business trip flipping a party-level switch would desy
 other eight.
 
 **Why fan-out and not a read-time union:** a union cannot represent divergence at all.
-Fan-out makes divergence natural and keeps every read per-membership and simple.
+Fan-out makes divergence natural and keeps every read per-account and simple.
 
 A watch party renders in a grid as one column with three states — all watched, some
 watched, none — rather than a single checkbox.
 
+### Leaving a group is a soft delete
+
+`membership.left_at` marks departure rather than deleting the row. Post visibility and
+display-name resolution both run through `membership`, so a hard delete would retroactively
+erase a departed member's notes from a board and leave replies to them dangling. One nullable
+column avoids all of it.
+
 ### Reveal is a mode, not a boolean
 
 ```
-reveal   membership_id, episode_id, mode, created_at
+reveal   account_id, episode_id, mode, created_at
          mode ∈ 'open' | 'synced'          -- absence of row = hidden
 ```
 
@@ -285,6 +316,49 @@ Two questions deferred until `synced` is built:
 - In synced mode the visible set changes second by second, which has an API shape
   implication — see §5.
 
+### Posts are portable across groups; replies and reactions are not
+
+You watch a series once, but you may be in several overlapping groups discussing it. A note
+you write on an episode should reach all of them without being retyped.
+
+So a post belongs to an **account** and an **episode**. Where it is visible is derived:
+
+- **`post.group_id IS NULL`** — portable. Visible in every group where the author is a
+  member and the group is discussing that title.
+- **`post.group_id` set** — scoped to that one group.
+
+Two invariants, enforced in the app layer:
+
+1. A reply always has `group_id` set. **Replies never travel.**
+2. A reply's `group_id` matches the group it was written in, and its parent must be visible
+   there.
+
+**The nullable column earns its keep twice.** It makes replies group-scoped, and it gives
+group-private top-level notes for free — "I want to say this only to the coworkers group" is
+just a scoped post. Portable is the default for a top-level note.
+
+**Reactions are keyed on `(post_id, group_id, account_id, emoji)`.** The same portable note
+accumulates separate reactions in each group, and one group's reactions never surface in
+another.
+
+**Display name and accent colour resolve through the *viewing* group's `membership`.** A
+portable note appears under whatever name and colour its author uses in the group reading it,
+with no extra work.
+
+**Visibility is derived at read time, not materialised.** Joining a fourth group therefore
+surfaces your existing notes there automatically, with no backfill, and the derivation cannot
+go stale. The trade-off is deliberate and worth stating: **joining a group exposes your back
+catalogue for any title that group discusses.**
+
+**The cost.** An earlier draft denormalised `group_id` onto `post` so the board read was a
+single indexed scan. Portability ends that — visibility now requires a join through
+`membership` to resolve whose posts the caller can see. Still one query; no longer one index
+lookup.
+
+The residual leak is content, not structure: a portable note whose body references another
+group's conversation ("I agree with what Sarah said") carries that across. Nothing structural
+can prevent it, and the words are the author's own.
+
 ### Progress is per-episode
 
 Outwatch tracked seasons and derived episode reveals. With arbitrary shows — including ones
@@ -302,6 +376,10 @@ watched.
 "Mark this whole series watched" on a 250-episode show, for a 10-member watch party, across
 `watched_episode` + `reveal`, is 5,000 rows — over DSQL's 3,000-row transaction cap. Bulk
 progress writes batch by episode range and commit per chunk.
+
+Account-level progress helps here rather than hurting: the row count no longer multiplies by
+how many groups discuss the title. Somebody in three *Star Trek* groups writes one set of
+rows, not three.
 
 ### Growth and pruning
 
@@ -325,14 +403,14 @@ A running session needs a cap — if `now - running_since` exceeds a sane episod
 (~4 hours), treat it as ended at the cap rather than banking wall-clock. This is read-path
 logic and belongs in the shared session helper, not in a pruning job.
 
-Cleanup runs lazily when a membership's sessions are touched, plus a sweep in the scheduled
+Cleanup runs lazily when an account's sessions are touched, plus a sweep in the scheduled
 Lambda that already runs for the TMDB refresh. No new infrastructure.
 
 | Table | Growth | Prunable? |
 | --- | --- | --- |
 | `watch_session` | Unbounded, worthless when dead | **Yes** — as above |
 | `invite` | Grows per invite issued | **Yes** — drop expired/revoked after a grace period |
-| `reveal`, `watched_episode` | members × episodes-in-catalog | No, but bounded and meaningful |
+| `reveal`, `watched_episode` | accounts × episodes-in-catalog | No, but bounded and meaningful |
 | `watch_offset` | Same bound, sparse — only actual corrections | No, but tiny |
 | `post`, `reaction` | Grows with use — but that is the product | User-deletable; reactions capped per post |
 | `title`, `episode` | Bounded by what groups actually discuss | Droppable with `group_title` |
@@ -371,10 +449,14 @@ Middleware resolves the token to an `account`; a second layer resolves
 
 ### Privacy invariant, enforced structurally
 
-Every route touching group data carries `:group_id` in the path, so no handler can
+Every route touching **group-scoped** data carries `:group_id` in the path, so no handler can
 accidentally read across groups. There are no discovery endpoints, no user search, and no
 way to enumerate groups. **Unauthorized and nonexistent both return 404** — carrying over
 Outwatch's principle that an error code must not become an oracle for which ids exist.
+
+The route table mirrors the layering rule in §4: **anything about watching is account-scoped
+and carries no `:group_id`**, because it is not group data. Progress belongs to the person,
+not to the room they are discussing it in.
 
 ### Routes
 
@@ -387,22 +469,48 @@ Outwatch's principle that an error code must not become an oracle for which ids 
 | `PATCH /api/groups/:g/me` | My membership: `display_name`, `accent_color` |
 | `POST /api/groups/:g/invites` / `DELETE /api/invites/:token` | Issue / revoke |
 | `POST /api/invites/:token/accept` | Join — the only way in |
-| `POST /api/groups/:g/watch-parties` | Create |
+| `DELETE /api/groups/:g/me` | Leave — soft delete, sets `left_at` |
+| `POST /api/watch-parties` | Create — account-level, not group-scoped |
 | `PATCH /api/watch-parties/:w/members/me` | `sharing_enabled` — the business-trip toggle |
 | `GET /api/catalog/search?q=` | Server-side TMDB proxy |
 | `POST /api/groups/:g/titles` `{tmdb_id}` | Ingest skeleton + attach |
 | `GET /api/groups/:g/titles/:t` | Season grid: my progress, reveal state, all columns |
-| `GET /api/groups/:g/episodes/:e/posts` | The board — reveal-filtered |
-| `POST /api/groups/:g/episodes/:e/posts` | `{body, reply_to_post_id}` |
-| `PATCH` / `DELETE /api/posts/:p` | Edit / delete own |
-| `PUT /api/posts/:p/reactions` | `{emoji, on}` — emoji in body, not path (astral chars) |
-| `PUT /api/groups/:g/episodes/:e/watched` | Mark one |
-| `POST /api/groups/:g/titles/:t/watched-through` | Bulk, chunked per §4 |
-| `POST /api/groups/:g/episodes/:e/reveal` | `{mode}` |
-| `POST /api/groups/:g/episodes/:e/timer` | `{action: start\|pause\|resume}` |
-| `PUT /api/groups/:g/episodes/:e/offset` | `{adjust_secs}` |
+| `GET /api/groups/:g/episodes/:e/posts` | The board — reveal-filtered, portable + scoped |
+| `POST /api/groups/:g/episodes/:e/posts` | `{body, reply_to_post_id, scope}` — see below |
+| `PATCH` / `DELETE /api/posts/:p` | Edit / delete own — applies in every group it reaches |
+| `PUT /api/groups/:g/posts/:p/reactions` | `{emoji, on}` — group-scoped; emoji in body, not path (astral chars) |
+| `PUT /api/episodes/:e/watched` | Mark one — account-scoped |
+| `POST /api/titles/:t/watched-through` | Bulk, chunked per §4 — account-scoped |
+| `POST /api/episodes/:e/reveal` | `{mode}` — account-scoped |
+| `POST /api/episodes/:e/timer` | `{action: start\|pause\|resume}` — account-scoped |
+| `PUT /api/episodes/:e/offset` | `{adjust_secs}` — account-scoped |
 
-### The read endpoint, and what synced reveal requires
+**Post creation keeps `:group_id` in the path even though a portable post has no group.**
+The group supplies the authorization check, scopes a reply, and resolves `scope`:
+`portable` (the default for a top-level note) writes `group_id = NULL`; `group` writes the
+path's group. A reply is forced to `group` regardless of what the caller sends.
+
+**Reactions carry `:group_id`** because they are group-scoped even when the post they attach
+to is not.
+
+### The board read
+
+`GET /api/groups/:g/episodes/:e/posts` resolves visibility in two parts, then applies the
+spoiler gate:
+
+```
+visible = { p : p.episode_id = e AND p.group_id IS NULL
+                AND p.author_account_id ∈ members(g) }        -- portable
+        ∪ { p : p.episode_id = e AND p.group_id = g }         -- scoped, incl. all replies
+```
+
+filtered by the caller's own `reveal` row for `e`. Reactions are loaded for `(post, g)` only.
+
+Because `reveal` is account-level, the gate is now a single lookup per episode rather than
+one per group — the caller either has revealed the episode or has not, and the answer does
+not change depending on which board they are reading.
+
+### What synced reveal requires
 
 Designed now even though `synced` ships later, because getting it wrong would mean
 rebuilding the read path.
@@ -574,9 +682,8 @@ until well past a few hundred users.
 ## 9. Open Questions
 
 - Final product name — "Spoilies" is a working name.
-- Whether `post.membership_id` and `post.author_account_id` should collapse into one column.
-  Both are kept for now: `membership_id` is what group-scoped queries index on,
-  `author_account_id` is what survives if someone leaves a group.
+- Whether a portable post should be retractable from one group without deleting it
+  everywhere — currently the only options are portable, or scoped at creation time.
 - Migration runner shape, given one DDL statement per transaction and no DDL/DML mixing.
 - **Phasing.** As specified this is a large first build. A plausible phase 1 is accounts +
   one group + titles + boards + `open`-mode reveal, deferring watch parties, timers, watch
