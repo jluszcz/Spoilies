@@ -2,7 +2,8 @@
 
 **Date:** 2026-08-02
 **Status:** Design complete. Catalog, architecture, data model, API surface, abuse posture,
-error handling, testing, and phasing are all decided. Ready for a P1 implementation plan.
+error handling, testing, account topology, and phasing are all decided. Ready for a P0
+implementation plan.
 
 > **Spoilies** is a working name, chosen so the project has an identity. Not final.
 
@@ -746,9 +747,119 @@ At the stated scale, essentially just a Route 53 hosted zone at $0.50/mo:
 Beyond free tier: DSQL is $8.00/M DPU and $0.33/GB-month (us-east-1/us-east-2). This holds
 until well past a few hundred users.
 
-## 9. Phasing
+### Free tier is aggregated across the organization
+
+**AWS applies free tier to the consolidated billing family, not to each account.** Usage is
+summed across every account in the organization, and eligibility dates from the *management*
+account's creation, not the member account's.
+
+Two consequences, one benign and one worth tracking:
+
+- **The always-free tiers do not expire**, so the management account's age is irrelevant to
+  everything in the table above. All of it is always-free rather than 12-month.
+- **The allowances are shared.** Spoilies competes with JakeSky and LambdUpdate for the
+  Lambda allowance. In practice those are tiny — LambdUpdate fires only on deploys — so the
+  headroom is real, and Cognito and DSQL are unused elsewhere, making those tiers effectively
+  all Spoilies'. But "$0/month" is a claim about the organization's aggregate, not about this
+  account in isolation.
+
+A corollary for §9: **spinning the account out has a small genuine cost benefit**, since a
+standalone account gets its own allowances rather than sharing them.
+
+## 9. AWS Account Topology
+
+Spoilies lives in **its own AWS account**, inside the existing organization, kept
+self-contained so it can be separated later without untangling anything.
+
+### Leaving the organization is not a one-way door
+
+`RemoveAccountFromOrganization` is a supported, documented operation. **Removing an account
+does not close it** — it becomes standalone with every resource intact, and it can rejoin
+later. Reversible in both directions.
+
+Requirements to leave:
+
+| Requirement | Note |
+| --- | --- |
+| Support plan, verified contact info, valid payment method | Org-created accounts do **not** collect these. AWS redirects through the missing sign-up steps at removal time. |
+| Four days since creation | Applies only to accounts created in the org, not invited ones. |
+| Not a delegated administrator | For any org-enabled service. Do not make this account the delegated admin for anything. |
+
+Four consequences to plan for rather than discover:
+
+- **`OrganizationAccountAccessRole` is not deleted automatically.** Org-created accounts get
+  an IAM role letting the management account assume in. Leaving does not remove it — the
+  former management account retains access until it is manually deleted. Nothing warns you.
+- **Cost and usage history does not follow the account.** The management account keeps it.
+  Export before separating if the history will ever matter to a business case.
+- **SCP restrictions vanish on exit**, so principals can end up with *more* permission than
+  they had. Audit IAM at separation rather than assuming separation only tightens things.
+- **Organization agreements stop covering it** (AWS Artifact). A BAA or DPA negotiated at org
+  level would need re-establishing — relevant on the commercial path.
+
+**What is genuinely one-way is moving resources between accounts**, which is exactly why the
+account is separate from day one. Transferring account ownership to a company is a *different*
+process again — AWS support plus a contract amendment — and is not what `LeaveOrganization`
+does.
+
+### Keep the account self-contained
+
+Every cross-account dependency is work at separation time. The rules:
+
+- **Terraform state lives in a bucket in this account.** LambdUpdate hardcodes
+  `jluszcz-tf-state` in the main account; Spoilies must not, or spin-out drags a state
+  migration into the one operation that should be boring.
+- **Its own** code bucket, LambdUpdate deployment, GitHub OIDC provider, and deploy roles.
+- **Never IAM Identity Center for workload identity.** It is org-level and dies at
+  separation. Fine for human console access; never for anything the application depends on.
+- **No org CloudTrail trail, Config aggregator, or RAM share** in the dependency path.
+- **A dedicated root email** that can be handed to a company later — an alias, not a personal
+  address.
+
+### Deployment topology
+
+The established pattern, unchanged: GitHub OIDC → assume a deploy role → `PutObject` the zip
+to the account's code bucket → S3 event → LambdUpdate → `UpdateFunctionCode`.
+
+**LambdUpdate needs no code changes.** It is already account-agnostic: it takes region from
+the S3 event and scopes its IAM to `arn:aws:lambda:<region>:<own-account>:function:*`.
+A second, independent instance is deployed into the Spoilies account.
+
+**Explicitly rejected: making LambdUpdate cross-account.** A main-account Lambda assuming into
+Spoilies would create precisely the permanent dependency this topology exists to avoid.
+
+Three things this requires:
+
+1. **LambdUpdate's Terraform backend becomes partial config** — the only repo change. Drop
+   `bucket` and `region` from the `backend "s3"` block and pass them via `-backend-config`
+   from env scripts, which become per-account-per-region. The alternative (one state bucket,
+   workspaces named `lambdupdate_<account>_<region>`) is less work but reintroduces the
+   cross-account state dependency.
+2. **A second deploy target in LambdUpdate's CI**, using a second account-id secret.
+   `deploy-lambda.yml` needs no change — `aws-account-id` is already a per-call secret input.
+3. **One-time bootstrap in the Spoilies account**, since these are Terraform `data` sources
+   that assume prior existence: the code bucket `code-<account>-<region>-an`, the GitHub OIDC
+   provider, and a `spoilies.github-deploy` role trusting `repo:jluszcz/Spoilies:*` with
+   `s3:PutObject` scoped to `.../spoilies.zip`. Single-region, so `regional: false` and no
+   suffix on the role name — matching JakeSky rather than LambdUpdate.
+
+Considered and set aside: Spoilies is a single Lambda, so it could call
+`update-function-code` directly from Actions and skip the S3 indirection entirely. That would
+need a new shared workflow, whereas deploying LambdUpdate reuses what already exists.
+
+## 10. Phasing
 
 Each phase is a coherent, shippable step, and each gets its own implementation plan.
+
+### P0 — Account bootstrap
+
+Everything in §9 that Terraform treats as pre-existing, and that therefore has to be true
+before anything else can deploy: the AWS account itself, its Terraform state bucket, the code
+bucket, the GitHub OIDC provider, the `spoilies.github-deploy` role, and a LambdUpdate
+instance in the account. Plus the LambdUpdate repo change to make its backend partial config,
+and the second deploy target in its CI.
+
+Small, but strictly first — P1's deploy step depends on all of it.
 
 ### P1 — Foundation and the spoiler gate
 
@@ -791,6 +902,6 @@ portable post. Retraction is purely additive — a `post_exclusion(post_id, grou
 and one anti-join on the read path — so it can wait until it is actually wanted. Until then
 the workarounds are to scope a note at creation, or to delete and rewrite it.
 
-## 10. Open Questions
+## 11. Open Questions
 
 - Final product name — "Spoilies" is a working name.
