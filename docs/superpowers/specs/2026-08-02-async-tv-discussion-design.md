@@ -287,8 +287,30 @@ watched, none — rather than a single checkbox.
 
 `membership.left_at` marks departure rather than deleting the row. Post visibility and
 display-name resolution both run through `membership`, so a hard delete would retroactively
-erase a departed member's notes from a board and leave replies to them dangling. One nullable
-column avoids all of it.
+erase a departed member's notes from a board and leave replies to them dangling.
+
+**`left_at` gates participation, not provenance.** The distinction is the whole point, and
+getting it backwards reintroduces the erasure the column exists to prevent:
+
+| Gated by `left_at` | Not gated by `left_at` |
+| --- | --- |
+| Reading the group | Whether your existing posts still render |
+| Writing to the group | Display name and accent colour resolution |
+| Appearing as a grid column | Replies already written under your posts |
+
+**A portable post is visible in group `g` if its author's membership in `g` had not ended
+when the post was written** — `left_at IS NULL OR post.created_at < left_at`. So `left_at` is
+an *upper* bound only. There is deliberately no lower bound, which is what makes joining
+backfill your whole back catalogue.
+
+That rule gives the three behaviours that matter:
+
+- Notes written **before** leaving stay visible forever, so replies under them never dangle.
+- Notes written **after** leaving, in some other group, do not appear — departing stops you
+  broadcasting into a group you left.
+- **Rejoining clears `left_at`** on the existing row rather than inserting a second one.
+  `(group_id, account_id)` is unique. Display name, accent colour, and identity survive, and
+  everything written while away becomes visible — consistent with joining always backfilling.
 
 ### Reveal is a mode, not a boolean
 
@@ -504,12 +526,24 @@ to is not.
 spoiler gate:
 
 ```
+members_at(g, t) = { a : ∃ m ∈ membership,
+                         m.group_id = g AND m.account_id = a
+                         AND (m.left_at IS NULL OR t < m.left_at) }
+
 visible = { p : p.episode_id = e AND p.group_id IS NULL
-                AND p.author_account_id ∈ members(g) }        -- portable
-        ∪ { p : p.episode_id = e AND p.group_id = g }         -- scoped, incl. all replies
+                AND p.author_account_id ∈ members_at(g, p.created_at) }   -- portable
+        ∪ { p : p.episode_id = e AND p.group_id = g }        -- scoped, incl. all replies
 ```
 
 filtered by the caller's own `reveal` row for `e`. Reactions are loaded for `(post, g)` only.
+
+**`members_at` is evaluated at the post's creation time, not at read time**, and that is
+load-bearing. Evaluating current membership instead would drop a departed author's portable
+posts from the board on the very next read — the exact erasure `left_at` exists to prevent —
+while their scoped replies, which match on `p.group_id = g` unconditionally, would remain and
+dangle under a parent that no longer renders. Scoped top-level posts are unaffected either
+way, so the hazard is specific to portable posts whose author has left one of the groups they
+reached.
 
 Because `reveal` is account-level, the gate is now a single lookup per episode rather than
 one per group — the caller either has revealed the episode or has not, and the answer does
