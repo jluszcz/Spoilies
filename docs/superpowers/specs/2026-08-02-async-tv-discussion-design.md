@@ -1,9 +1,8 @@
 # Spoilies — Async TV Discussion Service Design
 
 **Date:** 2026-08-02
-**Status:** Design complete, pending review. Catalog, architecture, data model, API surface,
-abuse posture, error handling, and testing are all decided. Phasing is the main open item
-before an implementation plan.
+**Status:** Design complete. Catalog, architecture, data model, API surface, abuse posture,
+error handling, testing, and phasing are all decided. Ready for a P1 implementation plan.
 
 > **Spoilies** is a working name, chosen so the project has an identity. Not final.
 
@@ -350,6 +349,12 @@ surfaces your existing notes there automatically, with no backfill, and the deri
 go stale. The trade-off is deliberate and worth stating: **joining a group exposes your back
 catalogue for any title that group discusses.**
 
+Two alternatives were considered and rejected: asking at join time (needs `joined_at` plus a
+visibility floor on `post.created_at`, and bakes in a choice made once with no way to revisit)
+and flooring at `joined_at` always (most private, but a new group sees an empty board from you
+even on episodes you have written about extensively). Always-backfill matches the premise —
+you watched the series once, and the notes are about the episode, not about the room.
+
 **The cost.** An earlier draft denormalised `group_id` onto `post` so the board read was a
 single indexed scan. Portability ends that — visibility now requires a join through
 `membership` to resolve whose posts the caller can see. Still one query; no longer one index
@@ -638,16 +643,44 @@ episode gaps.
 
 MySQL was considered and **rejected**. The two gaps are different kinds of problem:
 
-- **Postgres → DSQL is a *subset* gap.** DSQL speaks the Postgres wire protocol and removes
-  features (foreign keys, triggers, sequences, PL/pgSQL, temp tables). Anything that works
-  on DSQL also works on stock Postgres, so a **migration lint can mechanically catch the
-  entire divergence** — reject the forbidden syntax in CI and local tests become trustworthy.
+- **Postgres → DSQL is *almost entirely* a subset gap.** DSQL speaks the Postgres wire
+  protocol and removes features (foreign keys, triggers, sequences, PL/pgSQL, temp tables).
+  Nearly everything that works on DSQL also works on stock Postgres, so a **migration lint
+  catches almost the whole divergence** — reject the forbidden syntax in CI and local tests
+  become trustworthy.
+
+  **The one real exception is index creation.** DDL requiring background work must use the
+  `ASYNC` variant on DSQL: plain `CREATE INDEX` is unsupported there, and `CREATE INDEX
+  ASYNC` is not valid Postgres. Every index migration therefore runs on exactly one of the
+  two, and no lint can reconcile that — it is a translation, not a subset. The migration
+  runner handles it as a single sanctioned rewrite (see below), and the lint enforces that
+  it stays the only one.
 - **MySQL → DSQL is a *translation* gap.** Different protocol and dialect
   (`ON DUPLICATE KEY UPDATE` vs `ON CONFLICT`, different `RETURNING`, UUID storage, JSON
   functions, collation and NULL semantics), no subset relationship, and nothing can lint for
   it. You would write SQL twice and test neither.
 
 This resolves the local-development open question.
+
+### Migration runner
+
+DSQL's constraints compose into a fairly forced design. Hand-rolled against a `_migrations`
+table (~150 lines); sqlx's and refinery's migrators both wrap files in a transaction by
+default, which is exactly what DSQL forbids.
+
+- **One statement per migration file**, applied with autocommit and no wrapping transaction.
+  DSQL allows one DDL per transaction and forbids mixing DDL with DML, so a multi-statement
+  file breaks. Seed data is always its own migration, never appended to a schema change.
+- **`CREATE INDEX ASYNC` → `CREATE INDEX` when targeting Postgres.** One substitution,
+  documented as the only permitted divergence, enforced by the lint above.
+- **Wait for async index builds before marking a migration applied.** `CREATE INDEX ASYNC`
+  returns a `job_id` immediately and builds in the background; `sys.wait_for_job(job_id)`
+  blocks until it finishes. Without this, migration N+1 can run against an index that does
+  not exist yet — AWS explicitly recommends the wait during schema migration.
+- **A failed index build leaves the index `INVALID`, not absent.** Fail loudly and require a
+  manual `DROP INDEX`; proceeding silently leaves a unique index that enforces constraints
+  while being unusable for reads. Note `sys.jobs` purges completed and failed rows after 30
+  minutes, so it is not an audit log.
 
 ### Test strategy
 
@@ -679,12 +712,51 @@ At the stated scale, essentially just a Route 53 hosted zone at $0.50/mo:
 Beyond free tier: DSQL is $8.00/M DPU and $0.33/GB-month (us-east-1/us-east-2). This holds
 until well past a few hundred users.
 
-## 9. Open Questions
+## 9. Phasing
+
+Each phase is a coherent, shippable step, and each gets its own implementation plan.
+
+### P1 — Foundation and the spoiler gate
+
+Cognito with invite-gated signup; `account`, `group`, `membership`, `invite`; `post`
+(portable and scoped); `reveal` in `open` mode only; `watched_episode`; the board read with
+the gate applied. Plus the infrastructure: DSQL wiring, migration runner, CloudFront +
+Lambda deploy.
+
+**The catalog is hand-seeded in P1, with real TMDB IDs and real episode structure**, loaded
+from a seed migration rather than the API. `post`, `reveal`, and `watched_episode` all
+reference `episode_id`; inventing episode identities here and replacing them in P2 would
+force a data migration or lose data. Seeding real rows through a different *mechanism* means
+P2 changes only how rows arrive, not what they are.
+
+This reaches a working spoiler gate — the one thing the whole product rests on — without
+TMDB integration in the way.
+
+### P2 — Catalog
+
+TMDB search proxy with per-account rate limiting, skeleton ingest, `group_title` management,
+and the scheduled sync enforcing the six-month cache limit from §2. Replaces the P1 seed
+mechanism.
+
+### P3 — Conversation depth
+
+Replies, reactions, edits, deletes. Note counts and the display preferences that govern them.
+
+### P4 — Watch parties and timers
+
+`watch_party` with fan-out and the `sharing_enabled` toggle; `watch_session`, `watch_offset`,
+and `post.offset_secs`. The first phase with real concurrency exposure, so the OCC retry
+work in §7 lands here.
+
+### P5 — Synced reveal
+
+`synced` mode, the polling read path, and the lookahead window.
+
+**Deferred indefinitely:** Trakt watch-history import (§2), and per-group retraction of a
+portable post. Retraction is purely additive — a `post_exclusion(post_id, group_id)` table
+and one anti-join on the read path — so it can wait until it is actually wanted. Until then
+the workarounds are to scope a note at creation, or to delete and rewrite it.
+
+## 10. Open Questions
 
 - Final product name — "Spoilies" is a working name.
-- Whether a portable post should be retractable from one group without deleting it
-  everywhere — currently the only options are portable, or scoped at creation time.
-- Migration runner shape, given one DDL statement per transaction and no DDL/DML mixing.
-- **Phasing.** As specified this is a large first build. A plausible phase 1 is accounts +
-  one group + titles + boards + `open`-mode reveal, deferring watch parties, timers, watch
-  offsets, and `synced` reveal. Needs deciding before an implementation plan is written.
