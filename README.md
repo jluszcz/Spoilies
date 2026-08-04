@@ -34,7 +34,7 @@ cargo clippy --all-targets -- -D warnings
 pre-commit run --all-files    # includes cargo fmt --check
 ```
 
-CI is a thin caller of `jluszcz/github-utils/.github/workflows/rust-ci.yml@v1`, which runs
+CI is a thin caller of `jluszcz/github-utils/.github/workflows/rust-ci.yml`, which runs
 build, test, `cargo fmt --check`, and `cargo clippy --all-targets -- -D warnings` on
 `ubuntu-24.04-arm` against the `aarch64-unknown-linux-musl` target — the Lambda runtime the
 service deploys to. To reproduce a CI failure exactly, append `--target
