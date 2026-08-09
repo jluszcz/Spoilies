@@ -1,10 +1,10 @@
 # Spoilies — Async TV Discussion Service Design
 
 **Date:** 2026-08-02
-**Status:** Catalog, architecture, data model, API surface, abuse posture, error handling,
-testing, account topology, and phasing are decided. **P0 is ready to plan.** P1 is not, until
-the three questions under "Blocking P1" in §11 are answered — all three govern what the spoiler
-gate returns, which is the one thing the product rests on.
+**Status:** Design complete. Catalog, architecture, data model, API surface, abuse posture,
+error handling, testing, account topology, and phasing are all decided, including exactly what
+the spoiler gate returns on a locked board. **P0 and P1 are both ready to plan.** The remaining
+items in §11 are product decisions that later phases need, not blockers.
 
 > **Spoilies** is a working name, chosen so the project has an identity. Not final.
 
@@ -662,9 +662,33 @@ as an ordinary audit column, but `members_at` turns it into a security boundary:
 client-supplied timestamp predating `left_at` would make a post visible in a group its author
 had already left. The same applies to `membership.left_at`. Both are server clock, `timestamptz`.
 
-Because `reveal` is account-level, the gate is now a single lookup per episode rather than
-one per group — the caller either has revealed the episode or has not, and the answer does
-not change depending on which board they are reading.
+Because `reveal` is account-level, the gate is a single lookup per episode rather than one per
+group — the caller either has revealed the episode or has not, and the answer does not change
+depending on which board they are reading. **Posts are scoped to groups; revelation is not.**
+`reveal` deliberately carries no `group_id`: you watch an episode once, so there is one answer
+to "have I opened this board", and giving it a group would let the same episode be
+simultaneously open and hidden for someone who watched it exactly once — the redundancy the
+layering rule in §4 exists to prevent.
+
+### What a locked board still returns
+
+A locked board is not an empty response. Two things survive the gate, and both are deliberate:
+
+- **Your own posts, always.** You can write to a board before revealing it, so you can have
+  notes on an episode you have not opened. Hiding your own words from you is a bug, not a gate
+  — the gate exists to keep *other people's* observations away from you.
+- **The distinct authors who have written there.** This is what tells you whether opening the
+  board is worth it, and it is the same call Outwatch made. Author identity resolves through the
+  viewing group's `membership` as everywhere else, and the list runs through `members_at` like
+  the posts do — so a locked board names only authors whose posts you would actually see once
+  it opened.
+
+Nothing else does. No bodies, no reactions, no timestamps from other authors.
+
+**A visible reply whose parent is hidden renders without its quote.** Own-posts-always makes
+this reachable: your reply survives the gate while the post it answers does not. The parent is
+included only when it is itself in the visible set — the same rule Outwatch applies in
+`quoteOf`, and the mirror image of the dangling-reply hazard `members_at` guards against.
 
 ### What synced reveal requires
 
@@ -704,9 +728,14 @@ Two refinements:
 A note count is a mild spoiler: eleven notes on episode 7 of thirteen says something
 happened, before anything is revealed.
 
-- **Floor, always visible, not configurable** — a boolean: does this episode have any notes.
-  Needed to decide what to watch next, and a much weaker signal than a count.
+- **Floor, always visible, not configurable** — the author list from the locked board above.
+  It answers "is opening this worth it", which is what the floor is for, and it already implies
+  the weaker "does this episode have any notes".
 - **Preference** — exact counts, default on, `account.show_note_counts`.
+
+The floor is therefore the author list rather than a boolean. That is a stronger signal than an
+earlier draft allowed, and it is the right one: names are what make the count actionable, and a
+count without them is both less useful and barely less revealing.
 
 ## 6. Abuse and Cost Protection
 
@@ -931,8 +960,16 @@ will ever have, which is why it belongs here rather than being rediscovered duri
   `sqlx`'s compile-time query checking runs against Postgres, so it complements rather than
   replaces this.
 
-**The test that matters most:** assert a hidden post never appears in *any* response shape —
-board read, note counts, search, error messages. That invariant is what the product rests on.
+**The test that matters most:** assert that a post the caller may not see never appears in
+*any* response shape — board read, note counts, search, error messages. That invariant is what
+the product rests on.
+
+State it as "may not see" rather than "is hidden", because a locked board is not empty: the
+caller's own posts and the author list both survive it by design (§5). A test asserting that a
+locked board returns nothing would be asserting the wrong invariant, and the two exceptions are
+exactly where a leak would hide — so each needs its own case. The author list in particular must
+be filtered through `members_at`, or a locked board names people whose posts the caller could
+not see even after opening it.
 
 ## 8. Cost Model
 
@@ -1131,20 +1168,6 @@ and one anti-join on the read path — so it can wait until it is actually wante
 the workarounds are to scope a note at creation, or to delete and rewrite it.
 
 ## 11. Open Questions
-
-### Blocking P1
-
-- **Is `reveal` account-level or group-level?** §4 and §5 currently say account-level, and the
-  layering rule in §4 is built on it — an episode is watched once, so the board either is open
-  to you or is not, in every group. If a board should instead be lockable group-by-group,
-  `reveal` needs `group_id` back, which reintroduces the exact redundancy the layering rule was
-  written to remove. **The document as written assumes account-level.**
-- **Does the author see their own posts on a locked board?** The gate in §5 as stated hides
-  everything, including notes you wrote yourself before revealing the episode. Outwatch showed
-  them back. Recommendation: yes — hiding your own words from you is a bug, not a gate.
-- **Are author names listed on a locked board?** Outwatch did this deliberately: it tells you
-  whether opening the board is worth it. It is a strictly stronger signal than the "does this
-  episode have any notes" floor in §5, so it needs its own answer rather than inheriting one.
 
 ### Product decisions the schema depends on
 
