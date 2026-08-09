@@ -293,7 +293,7 @@ migrations:
 | `watch_party_member` | `(watch_party_id, account_id)` |
 | `invite` | `(token)` |
 | `title` | `(tmdb_id)` |
-| `episode` | `(title_id, season_number, episode_number)` and `(tmdb_id)` |
+| `episode` | `(tmdb_id)` only — position is indexed, not unique |
 | `group_title` | `(group_id, title_id)` |
 | `reaction` | `(post_id, group_id, account_id, emoji)` |
 | `reveal` | `(account_id, episode_id)` |
@@ -306,6 +306,15 @@ migrations:
 *linking* key: it is what lets a federated identity added later attach to an existing native
 user rather than forking into a second account (§6). Outwatch learned the case-sensitivity
 half of this the hard way — see its `migrations/0004_email_nocase.sql`.
+
+**`(title_id, season_number, episode_number)` is an index, not a unique constraint**, and that
+is deliberate. Making it unique would fight the renumbering `episode.tmdb_id` exists to survive:
+a sync that permutes numbering has to pass through intermediate states where two rows briefly
+claim one slot, and a non-deferrable unique constraint rejects that per row — so an `UPDATE`
+whose final state is perfectly valid fails depending on row order. `DEFERRABLE INITIALLY
+DEFERRED` is the usual escape, but it needs a unique *constraint* rather than a unique index,
+which sits badly with the `CREATE INDEX ASYNC` rule in §7. Position is TMDB's to get right;
+identity is `tmdb_id`. The index is still wanted, because the season grid reads by it.
 
 Creating these interacts with the `CREATE INDEX ASYNC` rule in §7; confirm whether DSQL wants
 each one inline on `CREATE TABLE` or as a separate async unique index before writing the
@@ -790,6 +799,12 @@ a trigger would reach DSQL.
 **Phase B: invites permit signup.** Flip `AllowAdminCreateUserOnly` off and add a pre-signup
 trigger that admits a registration when a pre-approval record exists **for the incoming email**.
 
+Nothing in the P1 schema provides that record, and it is left out on purpose rather than
+overlooked. `invite` is not obviously the right home: an invitation to a group for an account
+that already exists needs no email at all, so signup approval and group invitation may want to
+be separate tables. Phase B picks one; pre-declaring the wrong shape now is worse than declaring
+nothing.
+
 **An earlier draft made that trigger validate an invite *token*, and that does not work.** With
 the managed login UI you do not control the sign-up request, so there is no reliable place to
 carry a token through it; and the trigger also fires as `PreSignUp_ExternalProvider` on
@@ -1202,6 +1217,10 @@ the workarounds are to scope a note at creation, or to delete and rewrite it.
 
 - **Cognito tier.** The design assumes 10,000 MAU free *and* the managed login UI *and* (later)
   Google/Apple. Since the Lite/Essentials split those may not all sit in one tier.
+- **That federated sign-in creates a pool user regardless of `AllowAdminCreateUserOnly`.** §5
+  and §6 state this as fact and the entire phase-1 posture rests on it — it is the reason
+  federation is deferred rather than enabled now. It matches AWS's documented behaviour, but
+  nothing else in the design carries this much weight on an unverified claim.
 - **CloudFront OAC to a Lambda Function URL** — the `Authorization` collision and how request
   bodies are signed for POST/PUT (§3).
 - **DSQL specifics** — `sys.wait_for_job`, `INVALID` index behaviour, and how unique indexes
