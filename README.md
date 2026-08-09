@@ -17,7 +17,7 @@ A Rust backend on AWS, API-first, with clients (web, native) to follow.
 | Concern | Choice |
 | --- | --- |
 | API | Rust + `axum` in a single Lambda, behind CloudFront via a Function URL |
-| Identity | Amazon Cognito — invite-only signup, standard JWTs so no client type is assumed |
+| Identity | Amazon Cognito — admin-provisioned accounts at first, invite-only group access always, standard JWTs so no client type is assumed |
 | Data | Aurora DSQL — serverless Postgres, no VPC, genuinely zero idle cost |
 | Catalog | TMDB, cached locally and refreshed on a schedule |
 

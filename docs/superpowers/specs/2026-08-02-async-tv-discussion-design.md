@@ -1,9 +1,10 @@
 # Spoilies — Async TV Discussion Service Design
 
 **Date:** 2026-08-02
-**Status:** Design complete. Catalog, architecture, data model, API surface, abuse posture,
-error handling, testing, account topology, and phasing are all decided. Ready for a P0
-implementation plan.
+**Status:** Catalog, architecture, data model, API surface, abuse posture, error handling,
+testing, account topology, and phasing are decided. **P0 is ready to plan.** P1 is not, until
+the three questions under "Blocking P1" in §11 are answered — all three govern what the spoiler
+gate returns, which is the one thing the product rests on.
 
 > **Spoilies** is a working name, chosen so the project has an identity. Not final.
 
@@ -86,6 +87,11 @@ This makes refresh a hard requirement, not an optimisation:
   An `episode` row is two things fused: a stable internal identity that `post`, `reveal`,
   and `watched_episode` reference, and a mirror of TMDB fields. Only the second is subject
   to the six-month rule. Delete-and-recreate would orphan every post ever written.
+- **`episode` carries its own `tmdb_id`**, so sync matches on a stable identifier rather than
+  on `(season_number, episode_number)`. Position is not identity: TMDB renumbers, inserts
+  recaps, and reassigns specials, and a positional match would silently rewrite one episode's
+  row with another's data — carrying every post attached to it to the wrong episode. That is
+  the same orphaning hazard as delete-and-recreate, arriving through a quieter door.
 
 **Commercial use requires a written agreement.** *"If Your use (or intended use) is
 commercial, You must enter into a written agreement with TMDB that expressly permits Your
@@ -105,7 +111,10 @@ approved by TMDB."* The TMDB logo must be less prominent than the application's 
 - **A catalog swap later is a backfill, not a rewrite**, because internal IDs are ours and
   TMDB IDs are just another column.
 - **Episode titles are themselves spoilers.** A real catalog hands you names like "The One
-  Where Everyone Finds Out". Controlled by a per-account setting, titles shown by default.
+  Where Everyone Finds Out". Controlled by `account.show_unrevealed_episode_titles`, shown by
+  default. The setting is named for *episode* titles specifically: `title` is also the name of
+  the table holding a series, and a setting called `show_unrevealed_titles` reads as though it
+  governs which series you can see.
 
 ## 3. Architecture
 
@@ -113,8 +122,13 @@ approved by TMDB."* The TMDB logo must be less prominent than the application's 
 
 ```
 CloudFront  ──/api/*──>  Lambda Function URL  ──>  Rust/axum (Lambdalith)  ──>  Aurora DSQL
-     │                                                      │
-     └──/*──> S3 (static client, later)                     └──>  TMDB (ingest + scheduled sync only)
+     │        (OAC, AuthType=AWS_IAM)                       │
+     │                                                      └──>  TMDB (ingest + scheduled sync only)
+     ├── CloudFront Function (viewer request):
+     │     Authorization ──> X-Forwarded-Authorization
+     │     (SigV4 needs Authorization for itself)
+     │
+     └──/*──> S3 (static client, later)
 
 EventBridge Scheduler ──> same Lambda (scheduled entrypoint): TMDB refresh, session/invite pruning
 
@@ -153,16 +167,49 @@ every 15 minutes), `jsonwebtoken` for JWT verification, `cargo test` + testconta
 **One Lambda (a "Lambdalith")**, not a function per route. At this scale per-route Lambdas
 buy nothing and cost cold starts and deployment complexity.
 
-**CloudFront → Lambda Function URL, not API Gateway.** CloudFront's always-free tier is
-1 TB egress + 10M requests/month with no expiry. API Gateway HTTP API is $1/M with only a
-12-month free tier. The trade-off is losing API Gateway's built-in JWT authorizer — but
-that middleware is being written anyway, and Outwatch's `src/access.js` is a working
-reference for the shape (remote JWKS, pinned algorithm, audience check), even though the
-implementation language differs. One domain also means no CORS.
+**Region: us-east-2**, matching the existing estate. The one exception is the ACM certificate
+for CloudFront, which must live in **us-east-1** regardless.
 
-**Cognito for identity.** 10,000 MAUs free *permanently* — not a 12-month tier. Managed
-login UI, Google/Apple sign-in, standard JWTs. A small middleware layer is the entire user
-management story.
+**Not API Gateway.** CloudFront's always-free tier is 1 TB egress + 10M requests/month with no
+expiry; API Gateway HTTP API is $1/M with only a 12-month free tier. The trade-off is losing
+API Gateway's built-in JWT authorizer — but that middleware is being written anyway, and
+Outwatch's `src/access.js` is a working reference for the shape (remote JWKS, pinned
+algorithm, audience check), even though the implementation language differs.
+
+**What CloudFront is actually for.** The cost argument above rules out API Gateway; it does
+*not* justify CloudFront, because a Lambda Function URL has no per-request charge and calling
+it directly is already free. Three things earn its place, and none of them is speed:
+
+1. **A custom domain.** A Function URL is `https://<id>.lambda-url.us-east-2.on.aws` and
+   nothing can be aliased onto it. `api.<domain>` requires a distribution in front.
+2. **One origin for `/api/*` and the S3 client later** — one domain, therefore no CORS.
+3. **Somewhere to attach OAC**, which is what makes the Function URL non-public at all.
+
+It buys no caching. Responses vary by `Authorization`, and the ETag/304 path below revalidates
+at the origin, so Lambda runs either way. CloudFront here is a pass-through with a real
+hostname, and that is worth being honest about — if the client were ever native-only and an
+`on.aws` hostname acceptable, it could be dropped.
+
+**The Function URL is `AWS_IAM`, never `NONE`, fronted by CloudFront OAC.** With `NONE` the
+`*.lambda-url.us-east-2.on.aws` hostname is world-callable, and it leaks eventually — headers,
+error pages, a scanner. Anyone holding it then bypasses CloudFront entirely and invokes Lambda
+directly, which is precisely the denial-of-wallet exposure §6 names as the real risk. `AWS_IAM`
+plus OAC has CloudFront SigV4-sign every origin request; direct calls get 403.
+
+**This collides with bearer-token auth, and the collision has to be designed around.** SigV4
+puts its signature in the `Authorization` header — the same header §5 uses for the Cognito JWT.
+They cannot coexist on one request. The resolution is a CloudFront Function on viewer-request
+that copies `Authorization` into `X-Forwarded-Authorization`, with the middleware reading that
+header when running behind CloudFront. CloudFront Functions are ~$0.10/M, so the cost is
+nothing, but it is a component in the auth path and it belongs on the diagram. Confirm the
+current OAC behaviour — including how request bodies are signed for POST/PUT — before P1
+depends on it.
+
+**Cognito for identity.** 10,000 MAUs free *permanently* — not a 12-month tier. Managed login
+UI, standard JWTs, and Google/Apple available when wanted, though **phase 1 is email-only with
+no federated IdPs** (§5, §6). A small middleware layer is the entire user management story.
+Confirm which pricing tier carries both the free MAU allowance and the managed login UI before
+the cost model in §8 leans on it.
 
 **Aurora DSQL for data.** See comparison below.
 
@@ -210,7 +257,7 @@ complex discussion read stays one query.
 
 ```
 account            cognito_sub, email, display_name,
-                   show_unrevealed_titles, show_note_counts
+                   show_unrevealed_episode_titles, show_note_counts
 group              name, created_by
 membership         group_id, account_id, display_name, accent_color, sort_order, left_at
 watch_party        name
@@ -218,7 +265,7 @@ watch_party_member watch_party_id, account_id, sharing_enabled
 invite             group_id, token, created_by, expires_at, max_uses, uses, revoked_at
 
 title              tmdb_id, name, poster_path, status, tmdb_synced_at
-episode            title_id, season_number, episode_number, name, air_date, still_path
+episode            title_id, tmdb_id, season_number, episode_number, name, air_date, still_path
 group_title        group_id, title_id
 
 post               episode_id, author_account_id, group_id (nullable),
@@ -231,6 +278,38 @@ watch_offset       account_id, episode_id, adjust_secs
 ```
 
 All tables carry a UUID primary key.
+
+### Uniqueness constraints
+
+DSQL has no foreign keys, so these unique indexes are the *only* integrity the database
+enforces. Everything else — does this `account_id` exist, is this `episode_id` real — is
+app-layer validation. That makes the list worth stating in full rather than leaving to the
+migrations:
+
+| Table | Unique on |
+| --- | --- |
+| `account` | `(cognito_sub)`; `(email)`, lowercased — see §6 |
+| `membership` | `(group_id, account_id)` |
+| `watch_party_member` | `(watch_party_id, account_id)` |
+| `invite` | `(token)` |
+| `title` | `(tmdb_id)` |
+| `episode` | `(title_id, season_number, episode_number)` and `(tmdb_id)` |
+| `group_title` | `(group_id, title_id)` |
+| `reaction` | `(post_id, group_id, account_id, emoji)` |
+| `reveal` | `(account_id, episode_id)` |
+| `watched_episode` | `(account_id, episode_id)` |
+| `watch_session` | `(account_id, episode_id)` |
+| `watch_offset` | `(account_id, episode_id)` |
+| `group`, `watch_party`, `post` | Primary key only — no natural key |
+
+`account.email` is unique and lowercased from the first migration because it is the account
+*linking* key: it is what lets a federated identity added later attach to an existing native
+user rather than forking into a second account (§6). Outwatch learned the case-sensitivity
+half of this the hard way — see its `migrations/0004_email_nocase.sql`.
+
+Creating these interacts with the `CREATE INDEX ASYNC` rule in §7; confirm whether DSQL wants
+each one inline on `CREATE TABLE` or as a separate async unique index before writing the
+migrations.
 
 ### The layering rule
 
@@ -325,8 +404,20 @@ sync with the watch timer, auto-revealing as you watch**. Synced reveal is not "
 is "open up to where I am".
 
 - `open` — every post on the board is visible. Marking an episode watched writes this.
-- `synced` — visible posts are those whose *corrected* offset (`post.offset_secs` plus the
-  reader's `watch_offset`) is at or behind the reader's current timer position.
+- `synced` — visible posts are those whose *corrected* offset is at or behind the reader's
+  own corrected position. **A post is shifted by the correction of whoever wrote it, not by
+  the reader's:**
+
+  ```
+  post.offset_secs + adjust(post.author, e)  <=  reader_elapsed + adjust(reader, e)
+  ```
+
+  `offset_secs` is frozen in the *author's* frame (see §4, growth and pruning), so the
+  reader's own correction cannot undo the author's skew — only the author's can. The reader's
+  correction moves the reader's position, and the two are independent terms on opposite sides.
+  Outwatch reached the same conclusion and its read path is the reference implementation:
+  `p.offset_secs + adjustFor(p.user_id, episode)`, over *every* member's corrections rather
+  than just the caller's.
 
 **Only `open` ships in v1.** `synced` slots in as a new enum value, not a migration of
 meaning.
@@ -441,7 +532,14 @@ Lambda that already runs for the TMDB refresh. No new infrastructure.
 | `reveal`, `watched_episode` | accounts × episodes-in-catalog | No, but bounded and meaningful |
 | `watch_offset` | Same bound, sparse — only actual corrections | No, but tiny |
 | `post`, `reaction` | Grows with use — but that is the product | User-deletable; reactions capped per post |
-| `title`, `episode` | Bounded by what groups actually discuss | Droppable with `group_title` |
+| `title`, `episode` | Bounded by what groups actually discuss | **No — append-only once referenced** |
+
+**`title` and `episode` are append-only once referenced, and never dropped.** An earlier draft
+listed them as reclaimable when the last `group_title` went away. That is the same erasure §2
+forbids for the sync job, arriving by a different route: with no foreign keys nothing stops the
+delete, no error is raised, and every post, reveal, and watched marker pointing at those
+episodes becomes an unreadable orphan. The storage argument does not survive contact with the
+numbers either — a 250-episode series is 250 rows against a 1 GB tier.
 
 Everything else is bounded by catalog size times party size, far inside DSQL's 1 GB free
 storage tier.
@@ -453,6 +551,10 @@ storage tier.
 `Authorization: Bearer <cognito-jwt>`, verified in middleware with `jsonwebtoken` — remote
 JWKS (cached, refetched on unknown `kid`), pinned RS256, audience checked. Same shape as
 Outwatch's `src/access.js`, minus the Access-specific issuer handling.
+
+**On the wire behind CloudFront the token arrives as `X-Forwarded-Authorization`**, because
+OAC claims `Authorization` for its own SigV4 signature (§3). That is a transport detail the
+middleware absorbs; clients still send `Authorization` and never learn about it.
 
 **Bearer tokens rather than cookies specifically so no client type is assumed.** The API
 sees a string and never learns what produced it. Cookie sessions would have been the
@@ -468,9 +570,18 @@ Native-specific decisions to lock in early:
 
 - **Register as a public client with no secret.** A client secret shipped in an iOS binary
   is extractable; PKCE exists so one is not needed.
-- **Enable Sign in with Apple as a Cognito IdP now.** App Store review effectively requires
-  it once any other social login is offered, and adding an IdP after accounts exist means
-  account-linking work.
+- **No federated IdPs in phase 1 — email only.** An earlier draft enabled Sign in with Apple
+  from day one, reasoning that App Store review requires it once any other social login is
+  offered and that adding an IdP later means account-linking work. Both are true, and neither
+  applies yet: no client ships before P5, and federated sign-in would actively break the
+  signup posture in §6, because a user arriving through Google or Apple is created in the pool
+  regardless of `AllowAdminCreateUserOnly`. Enabling federation in phase 1 therefore *forces*
+  the pre-signup trigger that phase 1 exists to avoid.
+
+  The linking cost is paid down instead by keeping `account.email` unique, lowercased, and
+  Cognito-verified from the first migration (§4). Federation then attaches to the existing
+  native user via `AdminLinkProviderForUser` on matching verified email, leaving `cognito_sub`
+  unchanged — a lookup rather than a migration.
 
 Middleware resolves the token to an `account`; a second layer resolves
 `(account, group) → membership` on every group-scoped route.
@@ -491,7 +602,7 @@ not to the room they are discussing it in.
 | Route | Purpose |
 | --- | --- |
 | `GET /api/me` | Account + the groups I am in |
-| `PATCH /api/me` | `display_name`, `show_unrevealed_titles`, `show_note_counts` |
+| `PATCH /api/me` | `display_name`, `show_unrevealed_episode_titles`, `show_note_counts` |
 | `POST /api/groups` | Create a group |
 | `GET /api/groups/:g` | Members, watch parties, titles |
 | `PATCH /api/groups/:g/me` | My membership: `display_name`, `accent_color` |
@@ -546,6 +657,11 @@ dangle under a parent that no longer renders. Scoped top-level posts are unaffec
 way, so the hazard is specific to portable posts whose author has left one of the groups they
 reached.
 
+**`post.created_at` is assigned by the server and never accepted from the client.** It reads
+as an ordinary audit column, but `members_at` turns it into a security boundary: a
+client-supplied timestamp predating `left_at` would make a post visible in a group its author
+had already left. The same applies to `membership.left_at`. Both are server clock, `timestamptz`.
+
 Because `reveal` is account-level, the gate is now a single lookup per episode rather than
 one per group — the caller either has revealed the episode or has not, and the answer does
 not change depending on which board they are reading.
@@ -562,8 +678,13 @@ cheaply. It breaks the cost model for a feature needing at most second-level fre
 
 **Polling wins, and the client never tells the server where it is.** The server computes the
 caller's position from `watch_session` (`elapsed_secs` plus `now - running_since`, clamped
-by the 4-hour cap from §4), adds their `watch_offset` correction, and returns only posts at
-or behind it.
+by the 4-hour cap from §4) plus the caller's own `watch_offset`, and compares it against each
+post's offset corrected by *that post's author's* `watch_offset` — the two-sided comparison in
+§4. Both terms are needed and they are not interchangeable: the reader's correction moves the
+reader, the author's moves the post.
+
+The response also carries the **server clock**, so a client with a skewed one still renders a
+correctly ticking timer against the same positions the gate used.
 
 > A client cannot spoof its position to bypass the gate, because there is no position
 > parameter to spoof. If the position came from the request, the spoiler gate would be
@@ -610,16 +731,47 @@ Serverless does not degrade under abuse; it bills. Two controls, both free:
 costs ~$5/mo before a single request — doubling the entire infrastructure bill to solve a
 problem that does not exist yet. Application-level limits cost nothing.
 
-### 2. Cognito self-signup posture — the one structural choice
+### 2. Signup posture — two gates, not one
 
-If the user pool allows open self-registration, unbounded account and group creation is
-live and quotas become necessary. If account creation requires a valid invite, that surface
-collapses to zero: an attacker needs someone to invite them first.
+The important structural point is that **signup and group access are separate gates, and only
+the first one ever changes**:
 
-**Decision: a pre-signup Lambda trigger rejecting registration without a valid invite
-token.** Keeps self-service invite links working with no admin toil, while making "anyone
-can create an account" false. Relaxing this later is a config change; tightening it later
-means auditing accounts that already exist.
+| Gate | Controls | Phase A | Phase B | Phase C |
+| --- | --- | --- | --- | --- |
+| **Identity** | Who may hold a Cognito user at all | Admin creates each one | An invite permits signup | Open, with approval |
+| **Group access** | Which groups you can see | Invite redemption | *unchanged* | *unchanged* |
+
+Group access is invite-only in every phase — `POST /api/invites/:token/accept` is the only way
+into a group (§5), and an account in zero groups can see nothing, because every group-scoped
+route 404s. So the privacy model does not rest on how signup works, and loosening signup later
+cannot weaken it. That is what makes the progression below safe to defer rather than a door
+being left open.
+
+**Phase A (P1): `AllowAdminCreateUserOnly`, and nothing else.** Accounts are provisioned by
+hand with `admin-create-user`. No pre-signup trigger, no post-confirmation trigger, no admin
+route, no `is_admin` column — for a group this size that is minutes per year, and each of those
+is easier to add later than to remove. `account` rows are created **lazily by the auth
+middleware**: a valid JWT bearing an unknown `cognito_sub` inserts one from the token's `sub`
+and `email`. That keeps `account` in sync with Cognito without a trigger, and it is the same
+code path phases B and C need, so it is written once.
+
+This removes the Cognito trigger Lambda from P1 entirely — along with the question of how such
+a trigger would reach DSQL.
+
+**Phase B: invites permit signup.** Flip `AllowAdminCreateUserOnly` off and add a pre-signup
+trigger that admits a registration when a pre-approval record exists **for the incoming email**.
+
+**An earlier draft made that trigger validate an invite *token*, and that does not work.** With
+the managed login UI you do not control the sign-up request, so there is no reliable place to
+carry a token through it; and the trigger also fires as `PreSignUp_ExternalProvider` on
+federated first sign-in, where there is no token to carry at all. Matching on email needs
+neither, because the email is in the trigger event on both paths. The consequence is that
+phase-B invites are addressed to an email address rather than being anonymous links — arguably
+the better product for a private app. The rough edge to accept: someone invited at
+`alice@work.com` who signs in with Google as `alice@gmail.com` is rejected and needs a reissue.
+
+**Phase C: open registration with an approval queue**, gating `account` provisioning rather
+than Cognito. A relaxation of B, not a rewrite.
 
 ### 3. Invite tokens must be right the first time
 
@@ -627,10 +779,39 @@ Cryptographically random, ≥128 bits, never sequential, constant-time compariso
 attempts rate-limited per IP. A guessable or enumerable token is a total bypass of the
 privacy model.
 
+Behind CloudFront the client address comes from a forwarded header rather than the socket, so
+the limiter has to be told which one to trust. And per §6.4 that limiter is best-effort: entropy
+is what makes invites safe, not the rate limit.
+
 ### 4. TMDB search proxy rate limit — not for attackers
 
 The key is *ours*. A search-as-you-type box will hammer it accidentally, TMDB throttles the
 key, and every user is affected. Debounce client-side, cap per-account server-side.
+
+**Rate limiting is per-instance and in-memory — deliberately best-effort.** The algorithm is
+not the constraint: GCRA, a leaky bucket storing one timestamp per key, holds all the state
+needed in a few bytes. The constraint is that a *shared* limit needs shared state, and shared
+state means a synchronous write on the request path for a control that exists to save money.
+
+So global accuracy is given up on purpose, and the reserved concurrency cap is what makes that
+respectable rather than hand-waving: **with concurrency pinned at 10, a per-instance limit of
+`L` is a hard global ceiling of `10L`.** Not "approximately `L`" — a provable upper bound. Set
+`L` to a tenth of the target and the limiter is strictly conservative.
+
+Two honest limits, both acceptable here:
+
+- Counters die with the container, and this app is designed around containers being cold most
+  of the time — so most requests start with an empty bucket. A burst large enough to matter is
+  by definition hitting warm containers, and reserved concurrency already caps burn rate. It is
+  useless against a slow drip, which is not a denial-of-wallet problem.
+- It is a rate limiter, not a budget. It cannot enforce "1,000 searches this month".
+
+**For invite redemption (§6.3) the limiter is noise suppression, not the control.** Token
+entropy is: at ten concurrent instances guessing continuously, 128 bits is ~10³⁰ years out.
+The limiter must not be described as what makes invites safe.
+
+If a genuinely global limit is ever wanted without a hot-path write, a single DynamoDB
+`UpdateItem` is a few milliseconds and free at this scale. Not needed now.
 
 ### Deferred
 
@@ -717,6 +898,28 @@ default, which is exactly what DSQL forbids.
   while being unusable for reads. Note `sys.jobs` purges completed and failed rows after 30
   minutes, so it is not an audit log.
 
+### Migrations run from CI, before the code deploy
+
+**Not at Lambda cold start.** Concurrent cold starts would race on DDL, DSQL forbids DDL inside
+a transaction so there is no lock to serialize them with, and it taxes the cold start Rust was
+chosen to protect.
+
+**Not from a `migrate` entrypoint on the Lambda either**, tempting though it is given the
+scheduled entrypoint already exists. Deployment is fire-and-forget by design: CI does
+`PutObject`, an S3 event fires, LambdUpdate calls `UpdateFunctionCode` (§9). CI never learns
+when the new code went live, so it cannot reliably invoke the *new* code's migrations before
+that code starts serving.
+
+**So: GitHub Actions runs the migrations directly, before uploading the zip.** DSQL is a public
+IAM-authenticated endpoint, so this needs no VPC — only `dsql:DbConnectAdmin` on the deploy
+role, which P0 must grant.
+
+That ordering only works if a migration is safe against the code already running, which makes
+**expand/contract a standing rule rather than a practice**: additive DDL ships with the deploy
+that needs it, and drops ship a deploy later, once the code referencing the column is gone. No
+migration may break the currently-deployed binary. This constrains every migration the project
+will ever have, which is why it belongs here rather than being rediscovered during P1.
+
 ### Test strategy
 
 - **Unit, no database** — the highest-value tier. Session offset computation including the
@@ -747,6 +950,10 @@ At the stated scale, essentially just a Route 53 hosted zone at $0.50/mo:
 Beyond free tier: DSQL is $8.00/M DPU and $0.33/GB-month (us-east-1/us-east-2). This holds
 until well past a few hundred users.
 
+**The domain is not chosen yet, and nothing waits on it.** The hosted zone and the us-east-1
+ACM certificate are the only things it gates, so P1 deploys against CloudFront's default
+`*.cloudfront.net` hostname and gains an alias whenever a name is picked.
+
 ### Free tier is aggregated across the organization
 
 **AWS applies free tier to the consolidated billing family, not to each account.** Usage is
@@ -768,8 +975,8 @@ standalone account gets its own allowances rather than sharing them.
 
 ## 9. AWS Account Topology
 
-Spoilies lives in **its own AWS account**, inside the existing organization, kept
-self-contained so it can be separated later without untangling anything.
+Spoilies lives in **its own AWS account**, in **us-east-2**, inside the existing organization,
+kept self-contained so it can be separated later without untangling anything.
 
 ### Leaving the organization is not a one-way door
 
@@ -806,10 +1013,19 @@ does.
 
 Every cross-account dependency is work at separation time. The rules:
 
-- **Terraform state lives in a bucket in this account.** LambdUpdate hardcodes
-  `jluszcz-tf-state` in the main account; Spoilies must not, or spin-out drags a state
-  migration into the one operation that should be boring.
-- **Its own** code bucket, LambdUpdate deployment, GitHub OIDC provider, and deploy roles.
+- **Terraform state lives in a bucket in this account, managed from this repo.** LambdUpdate
+  hardcodes `jluszcz-tf-state` in the main account; Spoilies must not, or spin-out drags a
+  state migration into the one operation that should be boring. Note the chicken-and-egg: the
+  bucket holding the state cannot be a resource in the configuration it stores. Create it with
+  a small scripted bootstrap (versioning, public-access block, KMS encryption, matching the
+  conventions in the `AmazonWebServices` repo), then point the `backend "s3"` block at it.
+- **The code bucket, GitHub OIDC provider, and deploy role are `resource`s here, not `data`
+  sources.** This is a real departure from the JakeSky and LambdUpdate pattern, where those
+  already exist because the `AmazonWebServices` repo created them. That repo's backend is
+  `jluszcz-tf-state` in the main account, so extending it to cover Spoilies would recreate
+  exactly the cross-account state dependency this topology exists to avoid. Spoilies owns them
+  outright instead.
+- **Its own** LambdUpdate deployment.
 - **Never IAM Identity Center for workload identity.** It is org-level and dies at
   separation. Fine for human console access; never for anything the application depends on.
 - **No org CloudTrail trail, Config aggregator, or RAM share** in the dependency path.
@@ -837,11 +1053,13 @@ Three things this requires:
    cross-account state dependency.
 2. **A second deploy target in LambdUpdate's CI**, using a second account-id secret.
    `deploy-lambda.yml` needs no change — `aws-account-id` is already a per-call secret input.
-3. **One-time bootstrap in the Spoilies account**, since these are Terraform `data` sources
-   that assume prior existence: the code bucket `code-<account>-<region>-an`, the GitHub OIDC
-   provider, and a `spoilies.github-deploy` role trusting `repo:jluszcz/Spoilies:*` with
-   `s3:PutObject` scoped to `.../spoilies.zip`. Single-region, so `regional: false` and no
-   suffix on the role name — matching JakeSky rather than LambdUpdate.
+3. **One-time bootstrap in the Spoilies account.** Only the Terraform state bucket is truly
+   scripted-by-hand; the rest are ordinary resources in this repo's configuration: the code
+   bucket `code-<account>-us-east-2-an`, the GitHub OIDC provider, and a
+   `spoilies.github-deploy` role trusting `repo:jluszcz/Spoilies:*` with `s3:PutObject` scoped
+   to `.../spoilies.zip` **and `dsql:DbConnectAdmin` on the cluster**, since CI runs migrations
+   (§7). Single-region, so `regional: false` and no suffix on the role name — matching JakeSky
+   rather than LambdUpdate.
 
 Considered and set aside: Spoilies is a single Lambda, so it could call
 `update-function-code` directly from Actions and skip the S3 indirection entirely. That would
@@ -853,20 +1071,30 @@ Each phase is a coherent, shippable step, and each gets its own implementation p
 
 ### P0 — Account bootstrap
 
-Everything in §9 that Terraform treats as pre-existing, and that therefore has to be true
-before anything else can deploy: the AWS account itself, its Terraform state bucket, the code
-bucket, the GitHub OIDC provider, the `spoilies.github-deploy` role, and a LambdUpdate
-instance in the account. Plus the LambdUpdate repo change to make its backend partial config,
-and the second deploy target in its CI.
+Everything that has to be true before anything else can deploy: the AWS account itself, a
+scripted Terraform state bucket, and then — as ordinary resources in this repo's Terraform —
+the code bucket, the GitHub OIDC provider, the `spoilies.github-deploy` role (including
+`dsql:DbConnectAdmin`, per §7), and a LambdUpdate instance in the account. Plus the LambdUpdate
+repo change to make its backend partial config, and the second deploy target in its CI.
+
+Two scheduling notes: the account must exist **four days** before it could ever be removed from
+the organization (§9), so create it early even if nothing else starts; and org-created accounts
+carry no payment method, contact info, or support plan, which are collected at removal time
+rather than now.
 
 Small, but strictly first — P1's deploy step depends on all of it.
 
 ### P1 — Foundation and the spoiler gate
 
-Cognito with invite-gated signup; `account`, `group`, `membership`, `invite`; `post`
-(portable and scoped); `reveal` in `open` mode only; `watched_episode`; the board read with
-the gate applied. Plus the infrastructure: DSQL wiring, migration runner, CloudFront +
-Lambda deploy.
+Cognito in phase-A posture — `AllowAdminCreateUserOnly`, email only, no triggers and no
+federated IdPs (§6) — with `account` rows created lazily by the auth middleware; `group`,
+`membership`, `invite`; `post` (portable and scoped); `reveal` in `open` mode only;
+`watched_episode`; the board read with the gate applied. Plus the infrastructure: DSQL wiring,
+migration runner, CloudFront + OAC + the `Authorization` forwarding function, and the Lambda
+deploy.
+
+Note that `invite` ships here for **group membership**, which is invite-only in every phase —
+it is not yet involved in signup.
 
 **The catalog is hand-seeded in P1, with real TMDB IDs and real episode structure**, loaded
 from a seed migration rather than the API. `post`, `reveal`, and `watched_episode` all
@@ -903,5 +1131,62 @@ and one anti-join on the read path — so it can wait until it is actually wante
 the workarounds are to scope a note at creation, or to delete and rewrite it.
 
 ## 11. Open Questions
+
+### Blocking P1
+
+- **Is `reveal` account-level or group-level?** §4 and §5 currently say account-level, and the
+  layering rule in §4 is built on it — an episode is watched once, so the board either is open
+  to you or is not, in every group. If a board should instead be lockable group-by-group,
+  `reveal` needs `group_id` back, which reintroduces the exact redundancy the layering rule was
+  written to remove. **The document as written assumes account-level.**
+- **Does the author see their own posts on a locked board?** The gate in §5 as stated hides
+  everything, including notes you wrote yourself before revealing the episode. Outwatch showed
+  them back. Recommendation: yes — hiding your own words from you is a bug, not a gate.
+- **Are author names listed on a locked board?** Outwatch did this deliberately: it tells you
+  whether opening the board is worth it. It is a strictly stronger signal than the "does this
+  episode have any notes" floor in §5, so it needs its own answer rather than inheriting one.
+
+### Product decisions the schema depends on
+
+- **Group roles.** §6 says insider abuse is "solved socially, by removing them", but §5 has no
+  route to remove another member and no notion of who may issue invites, despite
+  `group.created_by` existing. Also unresolved: what happens to a group when the last member
+  leaves.
+- **Post deletion.** `DELETE /api/posts/:p` — hard delete or tombstone? A hard delete leaves
+  replies dangling under a missing parent, which is the failure `left_at` exists to prevent.
+- **Watch party membership.** No route adds, removes, invites, or accepts. Joining a household
+  exposes your progress to it, so it needs consent.
+- **Un-watch and un-reveal.** `PUT /api/episodes/:e/watched` takes no body; §7's own argument
+  for Outwatch's explicit `on` over a toggle applies here too. If an episode can be un-watched,
+  does that retract the reveal?
+- **Board read: ordering, pagination, and reply depth.** None are specified. Can a reply have a
+  reply?
+- **Note-count floor.** Computed through `members_at`, so it differs per viewer — and does it
+  count your own notes? If you are the only author, "has notes" tells you nothing.
+- **`membership.sort_order` has no route and no owner.** `PATCH /api/groups/:g/me` covers only
+  `display_name` and `accent_color`. Is ordering self-set (you choose your column position for
+  everyone) or viewer-set? Same question for `accent_color`: auto-assigned on join, unique
+  within a group, validated format? And is `membership.display_name` nullable, falling back to
+  `account.display_name`?
+- **`left_at` is lossy across repeated leave/rejoin.** One column cannot represent two gaps, so
+  notes written during an earlier absence become visible after a later departure. Probably
+  acceptable given always-backfill, but it should be stated rather than discovered.
+- **Episode ordering conventions.** Season 0 / specials, unaired episodes with null air dates,
+  and multi-part episodes all need a defined order before `POST /api/titles/:t/watched-through`
+  means anything — and the P1 hand-seed has to commit to that convention.
+
+### To verify before depending on
+
+- **Cognito tier.** The design assumes 10,000 MAU free *and* the managed login UI *and* (later)
+  Google/Apple. Since the Lite/Essentials split those may not all sit in one tier.
+- **CloudFront OAC to a Lambda Function URL** — the `Authorization` collision and how request
+  bodies are signed for POST/PUT (§3).
+- **DSQL specifics** — `sys.wait_for_job`, `INVALID` index behaviour, and how unique indexes
+  are created given the `ASYNC` rule (§4, §7).
+- **`sqlx` offline mode.** Compile-time query checking needs a live Postgres at build time or a
+  committed `.sqlx` cache; CI cross-compiles to `aarch64-unknown-linux-musl` with no database.
+  Worth an early spike alongside the DSQL SQLx connector's TLS stack on musl/ARM.
+
+### Naming
 
 - Final product name — "Spoilies" is a working name.
