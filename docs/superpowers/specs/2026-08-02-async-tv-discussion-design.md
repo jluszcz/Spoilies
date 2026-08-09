@@ -948,21 +948,36 @@ default, which is exactly what DSQL forbids.
 a transaction so there is no lock to serialize them with, and it taxes the cold start Rust was
 chosen to protect.
 
-**Not from a `migrate` entrypoint on the Lambda either**, tempting though it is given the
-scheduled entrypoint already exists. Deployment is fire-and-forget by design: CI does
-`PutObject`, an S3 event fires, LambdUpdate calls `UpdateFunctionCode` (§9). CI never learns
-when the new code went live, so it cannot reliably invoke the *new* code's migrations before
-that code starts serving.
-
-**So: GitHub Actions runs the migrations directly, before uploading the zip.** DSQL is a public
-IAM-authenticated endpoint, so this needs no VPC — only `dsql:DbConnectAdmin` on the deploy
-role, which P0 must grant.
+**GitHub Actions runs the migrations directly, before uploading the zip.** DSQL is a public
+IAM-authenticated endpoint, so this needs no VPC — only `dsql:DbConnectAdmin`.
 
 That ordering only works if a migration is safe against the code already running, which makes
 **expand/contract a standing rule rather than a practice**: additive DDL ships with the deploy
 that needs it, and drops ship a deploy later, once the code referencing the column is gone. No
 migration may break the currently-deployed binary. This constrains every migration the project
 will ever have, which is why it belongs here rather than being rediscovered during P1.
+
+**`dsql:DbConnectAdmin` is the strongest permission in the design, so it gets its own role.**
+It cannot be scoped below the cluster, and it is admin on the database — read everything, drop
+anything. That is a capability CI does not otherwise have: `lambda:UpdateFunctionCode` already
+lets CI run code as the function, but it reaches the data only through the application, and
+only through code that was reviewed and merged. Database admin is an independent path.
+
+So the trust boundary carries the scoping the IAM policy cannot:
+
+- **A separate `spoilies.github-migrate` role**, not the deploy role. The deploy role is
+  trusted broadly (`repo:jluszcz/Spoilies:*`) because it needs to work from any branch; putting
+  DDL rights on it would let any pushed branch migrate production.
+- **Trusted only from `repo:jluszcz/Spoilies:ref:refs/heads/main`**, so a pull-request branch
+  cannot assume it at all.
+- **Behind a GitHub Environment** with protection rules, which is where a manual approval gate
+  goes if one is ever wanted.
+
+**The alternative considered: a `migrate` entrypoint on the Lambda, invoked by CI.** That needs
+only `lambda:InvokeFunction`, which adds nothing to CI's blast radius — but it moves DDL rights
+onto the request-serving role, or costs a second function to avoid that. Running migrations
+directly is fewer moving parts, and the trust scoping above closes most of the gap. Revisit if
+CI's credentials ever become a real concern rather than a theoretical one.
 
 ### Test strategy
 
@@ -1016,11 +1031,10 @@ Two consequences, one benign and one worth tracking:
 
 - **The always-free tiers do not expire**, so the management account's age is irrelevant to
   everything in the table above. All of it is always-free rather than 12-month.
-- **The allowances are shared.** Spoilies competes with JakeSky and LambdUpdate for the
-  Lambda allowance. In practice those are tiny — LambdUpdate fires only on deploys — so the
-  headroom is real, and Cognito and DSQL are unused elsewhere, making those tiers effectively
-  all Spoilies'. But "$0/month" is a claim about the organization's aggregate, not about this
-  account in isolation.
+- **The allowances are shared.** Spoilies competes with the other projects in the organization
+  for the Lambda allowance. In practice those are tiny, so the headroom is real, and Cognito and
+  DSQL are unused elsewhere, making those tiers effectively all Spoilies'. But "$0/month" is a
+  claim about the organization's aggregate, not about this account in isolation.
 
 A corollary for §9: **spinning the account out has a small genuine cost benefit**, since a
 standalone account gets its own allowances rather than sharing them.
@@ -1065,19 +1079,18 @@ does.
 
 Every cross-account dependency is work at separation time. The rules:
 
-- **Terraform state lives in a bucket in this account, managed from this repo.** LambdUpdate
-  hardcodes `jluszcz-tf-state` in the main account; Spoilies must not, or spin-out drags a
-  state migration into the one operation that should be boring. Note the chicken-and-egg: the
+- **Terraform state lives in a bucket in this account, managed from this repo.** The other
+  projects hardcode `jluszcz-tf-state` in the main account; Spoilies must not, or spin-out drags
+  a state migration into the one operation that should be boring. Note the chicken-and-egg: the
   bucket holding the state cannot be a resource in the configuration it stores. Create it with
   a small scripted bootstrap (versioning, public-access block, KMS encryption, matching the
   conventions in the `AmazonWebServices` repo), then point the `backend "s3"` block at it.
 - **The code bucket, GitHub OIDC provider, and deploy role are `resource`s here, not `data`
-  sources.** This is a real departure from the JakeSky and LambdUpdate pattern, where those
-  already exist because the `AmazonWebServices` repo created them. That repo's backend is
-  `jluszcz-tf-state` in the main account, so extending it to cover Spoilies would recreate
-  exactly the cross-account state dependency this topology exists to avoid. Spoilies owns them
-  outright instead.
-- **Its own** LambdUpdate deployment.
+  sources.** This is a real departure from the JakeSky pattern, where those already exist
+  because the `AmazonWebServices` repo created them. That repo's backend is `jluszcz-tf-state`
+  in the main account, so extending it to cover Spoilies would recreate exactly the
+  cross-account state dependency this topology exists to avoid. Spoilies owns them outright
+  instead, which costs nothing because a human applies the Terraform.
 - **Never IAM Identity Center for workload identity.** It is org-level and dies at
   separation. Fine for human console access; never for anything the application depends on.
 - **No org CloudTrail trail, Config aggregator, or RAM share** in the dependency path.
@@ -1086,36 +1099,35 @@ Every cross-account dependency is work at separation time. The rules:
 
 ### Deployment topology
 
-The established pattern, unchanged: GitHub OIDC → assume a deploy role → `PutObject` the zip
-to the account's code bucket → S3 event → LambdUpdate → `UpdateFunctionCode`.
+**Terraform is applied from a laptop with an active SSO session, never from CI**, matching
+`AmazonWebServices`. CI's Terraform job runs `init -backend=false`, `fmt -check`, and `validate`
+— offline, with no AWS credentials configured at all.
 
-**LambdUpdate needs no code changes.** It is already account-agnostic: it takes region from
-the S3 event and scopes its IAM to `arn:aws:lambda:<region>:<own-account>:function:*`.
-A second, independent instance is deployed into the Spoilies account.
+That is what makes the ownership decision above cost nothing. Creating the OIDC provider and
+deploy roles from this repo's own configuration would be circular if CI applied the Terraform,
+since CI authenticates *through* those roles; because a human applies it, the first apply is
+just the first apply. An org-created account has no other credential path initially, so that
+apply necessarily runs through `OrganizationAccountAccessRole` assumed from the management
+account — the same role §9 warns survives account removal. CI takes over via OIDC afterwards.
 
-**Explicitly rejected: making LambdUpdate cross-account.** A main-account Lambda assuming into
-Spoilies would create precisely the permanent dependency this topology exists to avoid.
+**LambdUpdate is not part of this.** `github-utils` retired it in v2 (`deploy-lambda.yml`
+updates the function itself), and Spoilies already pins `@v2`. The current flow is: GitHub OIDC
+→ assume the deploy role → `PutObject` the zip to the account's code bucket →
+`lambda:UpdateFunctionCode` → `aws lambda wait function-updated-v2`. No S3 event, no second
+LambdUpdate instance, no partial-backend-config change in another repo, and no cross-account
+question to reject. An earlier draft of this section planned all of that; it is obsolete.
 
-Three things this requires:
+Two roles, deliberately split (§7):
 
-1. **LambdUpdate's Terraform backend becomes partial config** — the only repo change. Drop
-   `bucket` and `region` from the `backend "s3"` block and pass them via `-backend-config`
-   from env scripts, which become per-account-per-region. The alternative (one state bucket,
-   workspaces named `lambdupdate_<account>_<region>`) is less work but reintroduces the
-   cross-account state dependency.
-2. **A second deploy target in LambdUpdate's CI**, using a second account-id secret.
-   `deploy-lambda.yml` needs no change — `aws-account-id` is already a per-call secret input.
-3. **One-time bootstrap in the Spoilies account.** Only the Terraform state bucket is truly
-   scripted-by-hand; the rest are ordinary resources in this repo's configuration: the code
-   bucket `code-<account>-us-east-2-an`, the GitHub OIDC provider, and a
-   `spoilies.github-deploy` role trusting `repo:jluszcz/Spoilies:*` with `s3:PutObject` scoped
-   to `.../spoilies.zip` **and `dsql:DbConnectAdmin` on the cluster**, since CI runs migrations
-   (§7). Single-region, so `regional: false` and no suffix on the role name — matching JakeSky
-   rather than LambdUpdate.
+| Role | Trusted from | Grants |
+| --- | --- | --- |
+| `spoilies.github-deploy` | `repo:jluszcz/Spoilies:*` | `s3:PutObject` on `.../spoilies.zip`, `lambda:UpdateFunctionCode`, `lambda:GetFunction` |
+| `spoilies.github-migrate` | `repo:jluszcz/Spoilies:ref:refs/heads/main` | `dsql:DbConnectAdmin` on the cluster |
 
-Considered and set aside: Spoilies is a single Lambda, so it could call
-`update-function-code` directly from Actions and skip the S3 indirection entirely. That would
-need a new shared workflow, whereas deploying LambdUpdate reuses what already exists.
+Single-region, so `regional: false` and no suffix on the role names — matching JakeSky.
+
+The remaining hand-run step is the Terraform state bucket, which cannot be a resource in the
+configuration it stores.
 
 ## 10. Phasing
 
@@ -1124,10 +1136,14 @@ Each phase is a coherent, shippable step, and each gets its own implementation p
 ### P0 — Account bootstrap
 
 Everything that has to be true before anything else can deploy: the AWS account itself, a
-scripted Terraform state bucket, and then — as ordinary resources in this repo's Terraform —
-the code bucket, the GitHub OIDC provider, the `spoilies.github-deploy` role (including
-`dsql:DbConnectAdmin`, per §7), and a LambdUpdate instance in the account. Plus the LambdUpdate
-repo change to make its backend partial config, and the second deploy target in its CI.
+scripted Terraform state bucket, and then — as ordinary resources in this repo's Terraform,
+applied locally — the code bucket, the GitHub OIDC provider, and the two deploy roles from §9.
+Plus a Terraform `fmt`/`validate` job in CI, mirroring `AmazonWebServices`.
+
+**No cross-repo work.** An earlier draft had P0 deploying a second LambdUpdate instance and
+changing LambdUpdate's own backend and CI. `github-utils` v2 retired LambdUpdate, and Spoilies
+already pins `@v2`, so all of that is gone — P0 is now entirely within this repo and its AWS
+account.
 
 Two scheduling notes: the account must exist **four days** before it could ever be removed from
 the organization (§9), so create it early even if nothing else starts; and org-created accounts
