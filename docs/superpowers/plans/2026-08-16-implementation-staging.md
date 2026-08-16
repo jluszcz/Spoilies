@@ -48,7 +48,7 @@ Five principles, in priority order. Every deviation from §10 below traces to on
 
 | Stage | Name | Maps to | Ships |
 | --- | --- | --- | --- |
-| **S0** | Account, Terraform, and the two spikes | §10 P0 (+ P1's OAC verification) | Nothing user-facing. A deployable empty Lambda and two answered questions. |
+| **S0** | Account, Terraform, and the two spikes | §10 P0, plus P1's deployed request path and its verification | Nothing user-facing. A deployable empty Lambda behind CloudFront, and two answered questions. |
 | **S1a** | Walking skeleton: auth and deploy | §10 P1 (split) | `GET /api/me` behind a real Cognito JWT, deployed by CI. |
 | **S1b** | Schema, migration runner, write path | §10 P1 (split) | Migrations running from CI against DSQL. First writes, with OCC retry. |
 | **S1c** | Groups, invites, posts, and the gate | §10 P1 (split) | The product's core loop, on a hand-seeded catalog. |
@@ -323,11 +323,16 @@ unchanged polls return 304.
 Each of these is a staging decision, not a design change. The spec's phases are unchanged in
 content; what moves is *when* a piece of work happens.
 
-1. **The OAC verification moves from P1 to S0.** §11 assigns it to P1 because it needs a
-   deployed distribution. S0 deploys one anyway, so the verification is nearly free there and
-   expensive once middleware and handlers are written against an assumed answer.
+1. **The deployed request path moves from P1 to S0, and its verification with it.** §10's P1
+   carries "CloudFront + OAC + the `Authorization` forwarding function, and the Lambda deploy"
+   as infrastructure, and §11 assigns the OAC verification to P1 because it needs a deployed
+   distribution. S0 takes all of it: the function — which S0 needs regardless, to carry the
+   reserved-concurrency cap — the distribution, OAC, the viewer-request function, the deploy
+   pipeline, and the verification run against them. Answering the OAC question once middleware
+   and handlers are written against an assumed answer is the expensive version. What stays with
+   P1's successors is everything that runs *on* that path.
 2. **P1 splits into three stages.** As written, P1 bundles Cognito, DSQL wiring, the migration
-   runner, CloudFront and OAC, the deploy pipeline, five tables, seven route families, and the
+   runner, CloudFront and OAC, the deploy pipeline, ten tables, seven route families, and the
    spoiler gate. That is too large to plan, review, or debug as a unit, and it has no
    intermediate point where something works. S1a/S1b/S1c each end at a running, testable
    deliverable.
@@ -364,9 +369,10 @@ Resolved here so the per-stage plans do not each re-litigate them.
   nullable additive columns. Expand/contract is already a standing rule (§7), so additive DDL is
   routine — and creating a column three stages before anything reads it is a column nobody
   validates.
-- **`role` is the exception to that rule** and ships in S1c, per §10's explicit reasoning: it is
-  a column on a table S1c already creates, and adding it later needs a backfill deciding who was
-  retroactively in charge of every existing group.
+- **`role` is the exception to that rule.** It is declared on `membership` when S1b creates the
+  table, rather than added in S1c where it first means anything — per §10's reasoning, which the
+  split does not weaken: adding it later needs a backfill deciding who was retroactively in
+  charge of every existing group. S1b creates the column; S1c is what starts reading it.
 
 ## Module layout
 
