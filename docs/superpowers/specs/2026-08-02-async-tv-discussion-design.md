@@ -5,9 +5,9 @@
 **Status:** Design complete. Catalog, architecture, data model, API surface, abuse posture,
 error handling, testing, account topology, and phasing are all decided, including exactly what
 the spoiler gate returns on a locked board. The product decisions §11 once held open — group
-roles, post deletion, un-watch, board paging, membership presentation, episode ordering — are
-resolved and folded into the sections they belong to, and watch parties are cut. **P0 and P1
-are both ready to plan.**
+roles, post deletion, un-watch, board paging, membership presentation, watch-party consent,
+episode ordering — are resolved and folded into the sections they belong to. **P0 and P1 are both
+ready to plan.**
 
 ## 1. Context and Framing
 
@@ -168,8 +168,9 @@ every 15 minutes), `jsonwebtoken` for JWT verification, `cargo test` + testconta
 **One Lambda (a "Lambdalith")**, not a function per route. At this scale per-route Lambdas
 buy nothing and cost cold starts and deployment complexity.
 
-**Region: us-east-2**, matching the existing estate. The one exception is the ACM certificate
-for CloudFront, which must live in **us-east-1** regardless.
+**Region: us-east-2**, matching the existing estate — and, with no custom domain (§8), with no
+exceptions. Should a domain ever be added, its ACM certificate has to live in **us-east-1** to be
+usable by CloudFront, which is the only thing that would ever put a resource outside us-east-2.
 
 **Not API Gateway.** CloudFront's always-free tier is 1 TB egress + 10M requests/month with no
 expiry; API Gateway HTTP API is $1/M with only a 12-month free tier. The trade-off is losing
@@ -181,10 +182,12 @@ algorithm, audience check), even though the implementation language differs.
 *not* justify CloudFront, because a Lambda Function URL has no per-request charge and calling
 it directly is already free. Three things earn its place, and none of them is speed:
 
-1. **A custom domain.** A Function URL is `https://<id>.lambda-url.us-east-2.on.aws` and
-   nothing can be aliased onto it. `api.<domain>` requires a distribution in front.
-2. **One origin for `/api/*` and the S3 client later** — one domain, therefore no CORS.
-3. **Somewhere to attach OAC**, which is what makes the Function URL non-public at all.
+1. **Somewhere to attach OAC**, which is what makes the Function URL non-public at all. This one
+   is sufficient on its own.
+2. **One origin for `/api/*` and the S3 client later** — one hostname, therefore no CORS.
+3. **The option of a custom domain.** A Function URL is `https://<id>.lambda-url.us-east-2.on.aws`
+   and nothing can be aliased onto it, so `api.<domain>` would require a distribution in front.
+   No domain is being registered (§8), so this is a door left open rather than a reason.
 
 It buys no caching. Responses vary by `Authorization`, and the ETag/304 path below revalidates
 at the origin, so Lambda runs either way. CloudFront here is a pass-through with a real
@@ -239,6 +242,38 @@ still finding its shape.
 first query of a session returns. For an app opened a few times a week, nearly every
 session eats that stall. Also lands at $3–10/mo, brushing the cost ceiling.
 
+**Why not DuckDB over files in S3:** genuinely tempting, for everything it deletes. Local
+development would be exact rather than an approximation of DSQL, foreign keys would come back,
+the migration runner would stop being special, the 3,000-row transaction cap would disappear, and
+S3 object versioning is a passable point-in-time story for free.
+
+It fails on writes, and not marginally. **DuckDB cannot open a database file on S3 for writing at
+all** — `ATTACH` over HTTP or S3 is read-only, and omitting `READ_ONLY` errors with *"Cannot open
+an HTTP file for both reading and writing."* So every write is GET-the-whole-database, mutate a
+local copy, PUT-the-whole-database. The only concurrency primitive left is a conditional PUT on
+the object's ETag, which serialises every write in the system against every other one — a
+reaction conflicts with an unrelated reveal on a different show — and rewrites the entire
+database to record a hundred bytes. Nor can a conflict simply be retried: the local copy is stale
+by then, so each write has to be replayable against freshly fetched state. That is a hand-rolled
+transaction log sitting underneath `reveal`, `left_at`, and `members_at`, which are the
+invariants this design is least willing to get wrong.
+
+**DuckLake is the sanctioned multi-writer answer, and it does not help here.** It requires a
+catalog database with real concurrency; its own documentation puts Postgres in that role and
+labels DuckDB and SQLite catalogs as suitable only for local proofs of concept. That is DSQL plus
+S3 plus a lakehouse format, to store a few tens of megabytes.
+
+Two smaller costs worth recording. `sqlx`'s compile-time query checking — listed above as a
+deciding advantage of writing this in Rust — has no DuckDB backend, so it would become runtime
+validation on the read path the type system was chosen to police. And DuckDB is a columnar
+analytics engine being asked to serve small point lookups with a high write-to-data ratio, which
+is the inverse of its design centre. Cost decides nothing: both are $0 at this scale.
+
+The trade, stated plainly, is *incidental complexity already designed around* for *essential
+complexity that would have to be invented*, landing on the write path where a bug is a lost
+`reveal` rather than a slow query. **The same objection applies to any single-writer, whole-file
+store**, SQLite on S3 included; the constraint is the storage shape, not DuckDB.
+
 **Why DSQL:** serverless distributed Postgres on a public IAM-authenticated endpoint — no
 VPC, no NAT, no connection pooling infrastructure. Scales to zero with *no* resume penalty.
 Free tier is 100k DPUs + 1 GB storage permanently. SQL ergonomics are retained, so the
@@ -269,25 +304,27 @@ complex discussion read stays one query.
 ### Schema
 
 ```
-account          cognito_sub, email, display_name,
-                 show_unrevealed_episode_titles, show_note_counts
-group            name, created_by
-membership       group_id, account_id, role, display_name (nullable), accent_color,
-                 left_at, removed_by (nullable)
-invite           group_id, token, created_by, expires_at, max_uses, uses, revoked_at
+account            cognito_sub, email, display_name,
+                   show_unrevealed_episode_titles, show_note_counts
+group              name, created_by
+membership         group_id, account_id, role, display_name (nullable), accent_color,
+                   left_at, removed_by (nullable)
+invite             group_id, token, created_by, expires_at, max_uses, uses, revoked_at
+watch_party        name, created_by
+watch_party_member watch_party_id, account_id, status, sharing_enabled
 
-title            tmdb_id, name, poster_path, status, tmdb_synced_at
-episode          title_id, tmdb_id, season_number, episode_number, name, air_date, still_path
-group_title      group_id, title_id
+title              tmdb_id, name, poster_path, status, tmdb_synced_at
+episode            title_id, tmdb_id, season_number, episode_number, name, air_date, still_path
+group_title        group_id, title_id
 
-post             episode_id, author_account_id, group_id (nullable),
-                 body, created_at, edited_at, offset_secs,
-                 reply_to_post_id, parent_deleted_at
-reaction         post_id, group_id, account_id, emoji
-reveal           account_id, episode_id, mode, created_at
-watched_episode  account_id, episode_id, created_at
-watch_session    account_id, episode_id, elapsed_secs, running_since, last_activity_at
-watch_offset     account_id, episode_id, adjust_secs
+post               episode_id, author_account_id, group_id (nullable),
+                   body, created_at, edited_at, offset_secs,
+                   reply_to_post_id, parent_deleted_at
+reaction           post_id, group_id, account_id, emoji
+reveal             account_id, episode_id, mode, created_at
+watched_episode    account_id, episode_id, created_at
+watch_session      account_id, episode_id, elapsed_secs, running_since, last_activity_at
+watch_offset       account_id, episode_id, adjust_secs
 ```
 
 All tables carry a UUID primary key.
@@ -303,6 +340,7 @@ migrations:
 | --- | --- |
 | `account` | `(cognito_sub)`; `(email)`, lowercased — see §6 |
 | `membership` | `(group_id, account_id)` |
+| `watch_party_member` | `(watch_party_id, account_id)` |
 | `invite` | `(token)` |
 | `title` | `(tmdb_id)` |
 | `episode` | `(tmdb_id)` only — position is indexed, not unique |
@@ -312,7 +350,7 @@ migrations:
 | `watched_episode` | `(account_id, episode_id)` |
 | `watch_session` | `(account_id, episode_id)` |
 | `watch_offset` | `(account_id, episode_id)` |
-| `group`, `post` | Primary key only — no natural key |
+| `group`, `watch_party`, `post` | Primary key only — no natural key |
 
 `account.email` is unique and lowercased from the first migration because it is the account
 *linking* key: it is what lets a federated identity added later attach to an existing native
@@ -346,7 +384,7 @@ Every table sits at exactly one of two layers, and the layer follows from a sing
 
 | Layer | Keyed on | Holds |
 | --- | --- | --- |
-| **Account** | `account_id` | Everything about watching: progress, reveals, timers, offsets. Authored posts. Spoiler-display preferences. |
+| **Account** | `account_id` | Everything about watching: progress, reveals, timers, offsets. Authored posts. Spoiler-display preferences. Watch parties. |
 | **Membership** | `group_id` + `account_id` | Presentation and standing: display name, accent colour, role. Plus group-scoped conversation — replies and reactions. |
 
 You watch an episode once, so watching is account-level. You may present differently to your
@@ -408,23 +446,63 @@ integrity rule here:
   delete the group first; the attempt otherwise fails. A sole admin who is also the sole member
   leaves freely, and the group goes dormant — see below.
 
-### Rejected: watch parties
+### The watch party
 
-An earlier draft carried a `watch_party`: a persistent, account-level set of up to ten people who
-watch on the same screen, with progress fanned out at write time under a per-member
-`sharing_enabled` toggle, so a couple ticked each episode once between them. It is cut.
+A `watch_party` is a persistent set of accounts who watch together on the same screen — couples,
+roommates, families. **Up to 10 active members**, enforced in the app layer. It is not a group and
+has nothing to do with privacy: it holds no boards, no posts, and no visibility rules. Its entire
+job is that people who watched an episode together tick it once between them.
 
-It bought exactly one thing — a household clicking half as many checkboxes. Against that it
-wanted two tables, an invitation and consent flow of its own, a size cap enforced in the app, the
-most conflict-prone write path in the system (a ten-way fan-out under optimistic concurrency),
-the largest single contributor to the 3,000-row transaction cap, and a grid column with three
-states instead of a checkbox. Everything else works without it: both people tick their own boxes,
-and because progress is account-level they are simply two ordinary columns.
+**A watch party is account-level, not group-scoped.** Your household is your household regardless
+of which group you are looking at. Scoping parties to groups would break under account-level
+progress: somebody in a roommate party in one group and a partner party in another would have a
+single solo viewing fan out to both, claiming two households watched an episode when one person
+did. A party renders inside any group's grid as one column merging whichever of its members
+belong to that group.
 
-**Re-adding it would be a migration rather than an afterthought**, which is why the reasoning is
-recorded here instead of deleted. Nothing else in the design leans on it — account-level
-progress, `watch_offset`, and the per-author correction in the reveal comparison all stand on
-their own, and each was justified independently above.
+**Progress is always per-account.** Sharing is a *write-time fan-out*, not a shared row:
+
+> A write from account X propagates to the other members of X's watch party **only if X is
+> sharing**, and **only to members who are themselves sharing**.
+
+`watch_party_member.sharing_enabled` defaults to true. Flipping it off is symmetric — the
+traveller stops broadcasting and stops receiving in one action, and everyone else stays in
+sync with each other.
+
+**Why per-member and not per-party:** at size 2 a party-level toggle would be correct. At
+size 9, one roommate on a business trip flipping a party-level switch would desync the
+other eight.
+
+**Why fan-out and not a read-time union:** a union cannot represent divergence at all.
+Fan-out makes divergence natural and keeps every read per-account and simple.
+
+A watch party renders in a grid as one column with three states — all watched, some
+watched, none — rather than a single checkbox.
+
+**Joining requires consent, because a party exposes your progress to it.**
+`POST /api/watch-parties/:w/invites` takes an email address and always answers 202, so the route
+never becomes an oracle for which accounts exist (§5). If the address resolves, a
+`watch_party_member` row lands with `status = 'pending'`; the invitee sees it on `GET /api/me` and
+accepts or declines. Only `status = 'active'` rows take part in fan-out or count against the
+ten-member cap.
+
+Addressing the invite to an email rather than minting a token is the same call §6 makes for
+phase-B signup invites, and for the same reasons — but here it also spares two people who live in
+the same house a link-passing ritual. Restricting invitees to accounts you already share a *group*
+with was the alternative, and it fails the obvious case: your partner is your partner before the
+two of you happen to join the same discussion group.
+
+**`watch_party.created_by` may remove any member; anyone may remove themselves.** There is
+deliberately no role column here. The bus-factor argument that ruled a bare `created_by` out for
+groups barely applies to a household of at most ten: if the creator vanishes, the recovery is to
+leave and re-form the party, which costs nothing, because progress is per-account and never lived
+in the party to begin with. A group cannot be re-formed that cheaply — its conversation is inside
+it.
+
+**Leaving a party is a hard delete**, unlike leaving a group. Nothing references
+`watch_party_member` historically: fan-out happens at write time, so every past write is already
+materialised as ordinary per-account rows. There is no provenance to preserve, so there is no
+`left_at` here and no reason for one.
 
 ### Leaving a group is a soft delete
 
@@ -651,15 +729,15 @@ dates are often regional or wrong, and the grid renders by number regardless. Th
 ### Bulk writes must chunk
 
 "Mark this whole series watched" writes to both `watched_episode` and `reveal`, so it is two rows
-per episode. A 250-episode series is a comfortable 500; *One Piece* is already around 2,200, and
-a long-running soap clears DSQL's 3,000-row transaction cap outright. Bulk progress writes
-therefore batch by episode range and commit per chunk.
+per episode, and fan-out multiplies that by the sharing members of the author's watch party. A
+250-episode show for a 10-member party is 5,000 rows — over DSQL's 3,000-row transaction cap
+before the series is even a long one. Bulk progress writes batch by episode range and commit per
+chunk.
 
-Two decisions keep that ceiling far away rather than close to it. **Progress is account-level**,
-so the count does not multiply by how many groups discuss the title — somebody in three *Star
-Trek* groups writes one set of rows, not three. And **there is no watch-party fan-out** (see
-above); the cut removed a ten-times multiplier that, on a long series, was the only thing making
-the cap a routine concern rather than an edge case.
+Account-level progress helps here rather than hurting: the row count no longer multiplies by
+how many groups discuss the title. Somebody in three *Star Trek* groups writes one set of
+rows, not three. The remaining multiplier is party size, which is capped at ten — so the worst
+case is bounded and known, which is what makes fixed-size chunking sufficient.
 
 ### Growth and pruning
 
@@ -704,7 +782,7 @@ delete, no error is raised, and every post, reveal, and watched marker pointing 
 episodes becomes an unreadable orphan. The storage argument does not survive contact with the
 numbers either — a 250-episode series is 250 rows against a 1 GB tier.
 
-Everything else is bounded by catalog size times account count, far inside DSQL's 1 GB free
+Everything else is bounded by catalog size times party size, far inside DSQL's 1 GB free
 storage tier.
 
 ## 5. API Surface
@@ -767,7 +845,7 @@ not to the room they are discussing it in.
 | `GET /api/me` | Account + the groups I am in |
 | `PATCH /api/me` | `display_name`, `show_unrevealed_episode_titles`, `show_note_counts` |
 | `POST /api/groups` | Create a group — creator becomes its first admin |
-| `GET /api/groups/:g` | Members, titles |
+| `GET /api/groups/:g` | Members, watch parties, titles |
 | `DELETE /api/groups/:g` | Delete — **admin only** |
 | `PATCH /api/groups/:g/me` | My membership: `display_name`, `accent_color`, and self-demotion from `admin` |
 | `PATCH /api/groups/:g/members/:a` | `{role}` promotes to admin; `{removed: false}` re-admits. **Admin only** |
@@ -775,6 +853,10 @@ not to the room they are discussing it in.
 | `POST /api/groups/:g/invites` / `DELETE /api/invites/:token` | Issue / revoke — any member |
 | `POST /api/invites/:token/accept` | Join — the only way in |
 | `DELETE /api/groups/:g/me` | Leave — soft delete, sets `left_at` |
+| `POST /api/watch-parties` | Create — account-level, not group-scoped |
+| `POST /api/watch-parties/:w/invites` | `{email}` — always 202; creates a `pending` member if it resolves |
+| `PATCH /api/watch-parties/:w/members/me` | `{status}` accept/decline; `{sharing_enabled}` — the business-trip toggle |
+| `DELETE /api/watch-parties/:w/members/:a` | Leave, or removal by `created_by`. Hard delete |
 | `GET /api/catalog/search?q=` | Server-side TMDB proxy |
 | `POST /api/groups/:g/titles` `{tmdb_id}` | Ingest skeleton + attach |
 | `GET /api/groups/:g/titles/:t` | Season grid: my progress, reveal state, per-episode note floor, all columns |
@@ -1065,21 +1147,21 @@ three attempts, then a 409.
 
 That is only safe on idempotent transactions, which sorts the write paths in two:
 
-- **Naturally idempotent, retry freely** — reveals, `watched`, reactions, role changes,
-  membership removal. Every one of these is a `PUT` or a `PATCH` carrying the desired state
-  rather than a toggle, which is what makes them retryable at all. (Outwatch's choice to make
-  `PUT .../reactions` take an explicit `on` rather than toggling pays off directly here.)
+- **Naturally idempotent, retry freely** — reveals, `watched`, reactions, watch-party fan-out,
+  role changes, membership removal. Every one of these is a `PUT` or a `PATCH` carrying the
+  desired state rather than a toggle, which is what makes them retryable at all. (Outwatch's
+  choice to make `PUT .../reactions` take an explicit `on` rather than toggling pays off directly
+  here.)
 - **Not idempotent** — timer actions (`start` zeroes the session) and post creation. Retry
   after a *failed* transaction is still safe, since nothing committed. The risk is only
   retry after an **ambiguous** failure such as a network timeout after commit.
   **Decision for v1: accept it.** A duplicate note is a minor annoyance the author can
   delete. If it bites, a client-supplied idempotency key fixes it with no schema change.
 
-Conflict-prone paths to watch: reactions on a busy post, simultaneous timer ticks, and chunked
-bulk progress writes. Cutting watch parties removed what would have been the worst of them, a
-ten-way fan-out on every progress write. Separately, a migration's async index going active can
-surface a conflict in unrelated transactions touching that namespace (§3), so the retry wrapper
-matters during deploys and not only under user load.
+Conflict-prone paths to watch: fan-out to a 10-member watch party, reactions on a busy post,
+simultaneous timer ticks, and chunked bulk progress writes. Separately, a migration's async index
+going active can surface a conflict in unrelated transactions touching that namespace (§3), so
+the retry wrapper matters during deploys and not only under user load.
 
 ### Status conventions
 
@@ -1188,8 +1270,9 @@ CI's credentials ever become a real concern rather than a theoretical one.
 
 - **Unit, no database** — the highest-value tier. Session offset computation including the
   4-hour running cap, reveal filtering, `members_at` evaluation at post-creation time, the
-  watched-through range (season 0 and unaired episodes excluded), and bulk chunking are all pure
-  functions, and all are logic where a bug is a spoiler leak or silent data loss.
+  watched-through range (season 0 and unaired episodes excluded), fan-out target selection under
+  `sharing_enabled`, and bulk chunking are all pure functions, and all are logic where a bug is a
+  spoiler leak or silent data loss.
 - **Integration against stock Postgres** via testcontainers, paired with the migration lint
   above so dialect drift fails in CI rather than at deploy.
 - **Smoke suite against a real dev DSQL cluster in CI**, catching what the lint cannot.
@@ -1210,7 +1293,8 @@ not see even after opening it; and it must exclude the caller, or the floor stop
 
 ## 8. Cost Model
 
-At the stated scale, essentially just a Route 53 hosted zone at $0.50/mo:
+At the stated scale, **$0/month** — every component sits inside a permanent free tier, and there
+is no domain to pay for:
 
 | Service | Free allowance | Expiry |
 | --- | --- | --- |
@@ -1219,14 +1303,23 @@ At the stated scale, essentially just a Route 53 hosted zone at $0.50/mo:
 | Aurora DSQL | 100k DPU, 1 GB storage/mo | Always |
 | Cognito (Lite tier) | 10,000 MAU/mo | Always |
 | Lambda Function URLs | No per-request charge | n/a |
-| Route 53 hosted zone | — | $0.50/mo |
+| CloudFront Functions | ~$0.10/M — the `Authorization` forwarder (§3) | n/a |
+| S3 (code bucket, Terraform state) | 5 GB | 12 months, then pennies |
 
 Beyond free tier: DSQL is $8.00/M DPU and $0.33/GB-month (us-east-1/us-east-2). This holds
 until well past a few hundred users.
 
-**The domain is not registered yet, and nothing waits on it.** The hosted zone and the us-east-1
-ACM certificate are the only things it gates, so P1 deploys against CloudFront's default
-`*.cloudfront.net` hostname and gains an alias whenever the domain lands.
+**No domain is being registered, and nothing in the design needs one.** The service runs on
+CloudFront's default `*.cloudfront.net` hostname. That removes the only recurring charge in the
+estate — a Route 53 hosted zone at $0.50/mo — along with the us-east-1 ACM certificate and the
+cross-region wrinkle §3 notes about it.
+
+Adding a domain later is additive and small: register it, create the hosted zone, issue the
+certificate in us-east-1, and add an alias plus `viewer_certificate` to the existing distribution.
+Nothing else moves, because the distribution, the origin, OAC, and the auth path are all
+independent of the hostname. **The name "Spoilies" is settled regardless** — it is already the
+repo, the AWS account, the IAM role names, and the S3 key, and none of that depends on owning the
+matching domain.
 
 ### Free tier is aggregated across the organization
 
@@ -1395,11 +1488,12 @@ mechanism.
 Replies, reactions, edits, deletes — including the detach-and-mark rule for `parent_deleted_at`.
 Note counts and the display preferences that govern them.
 
-### P4 — Timers
+### P4 — Watch parties and timers
 
-`watch_session`, `watch_offset`, and `post.offset_secs`, with the 4-hour running cap and the
-lazy session cleanup from §4. The first phase where a single user generates concurrent writes,
-so the OCC retry work in §7 lands here.
+`watch_party` with the email-addressed invite, the pending/active consent flow, fan-out, and the
+`sharing_enabled` toggle; `watch_session`, `watch_offset`, and `post.offset_secs`, with the
+4-hour running cap and the lazy session cleanup from §4. The first phase with real concurrency
+exposure, so the OCC retry work in §7 lands here.
 
 ### P5 — Synced reveal
 
@@ -1410,16 +1504,13 @@ portable post. Retraction is purely additive — a `post_exclusion(post_id, grou
 and one anti-join on the read path — so it can wait until it is actually wanted. Until then
 the workarounds are to scope a note at creation, or to delete and rewrite it.
 
-**Cut, not deferred:** watch parties (§4). Re-adding them would be a migration and a new
-invitation flow, so it is a reversal of a decision rather than a later phase.
-
 ## 11. Open Questions
 
 The product decisions this section used to hold are resolved and now live in the sections they
 belong to: group roles and membership presentation in §4, post deletion and reply shape in §4,
-un-watch and episode ordering in §4, board paging and the note floor in §5. Watch parties are cut
-(§4). What remains is verification, and none of it changes a design decision — each answer
-changes an implementation.
+un-watch, episode ordering, and watch-party consent in §4, board paging and the note floor in §5.
+What remains is verification, and none of it changes a design decision — each answer changes an
+implementation.
 
 ### Verified, and what it settled
 
