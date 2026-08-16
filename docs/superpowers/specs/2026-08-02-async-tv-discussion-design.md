@@ -1,12 +1,13 @@
 # Spoilies — Async TV Discussion Service Design
 
 **Date:** 2026-08-02
+**Revised:** 2026-08-16
 **Status:** Design complete. Catalog, architecture, data model, API surface, abuse posture,
 error handling, testing, account topology, and phasing are all decided, including exactly what
-the spoiler gate returns on a locked board. **P0 and P1 are both ready to plan.** The remaining
-items in §11 are product decisions that later phases need, not blockers.
-
-> **Spoilies** is a working name, chosen so the project has an identity. Not final.
+the spoiler gate returns on a locked board. The product decisions §11 once held open — group
+roles, post deletion, un-watch, board paging, membership presentation, watch-party consent,
+episode ordering — are resolved and folded into the sections they belong to. **P0 and P1 are both
+ready to plan.**
 
 ## 1. Context and Framing
 
@@ -167,8 +168,9 @@ every 15 minutes), `jsonwebtoken` for JWT verification, `cargo test` + testconta
 **One Lambda (a "Lambdalith")**, not a function per route. At this scale per-route Lambdas
 buy nothing and cost cold starts and deployment complexity.
 
-**Region: us-east-2**, matching the existing estate. The one exception is the ACM certificate
-for CloudFront, which must live in **us-east-1** regardless.
+**Region: us-east-2**, matching the existing estate — and, with no custom domain (§8), with no
+exceptions. Should a domain ever be added, its ACM certificate has to live in **us-east-1** to be
+usable by CloudFront, which is the only thing that would ever put a resource outside us-east-2.
 
 **Not API Gateway.** CloudFront's always-free tier is 1 TB egress + 10M requests/month with no
 expiry; API Gateway HTTP API is $1/M with only a 12-month free tier. The trade-off is losing
@@ -180,10 +182,12 @@ algorithm, audience check), even though the implementation language differs.
 *not* justify CloudFront, because a Lambda Function URL has no per-request charge and calling
 it directly is already free. Three things earn its place, and none of them is speed:
 
-1. **A custom domain.** A Function URL is `https://<id>.lambda-url.us-east-2.on.aws` and
-   nothing can be aliased onto it. `api.<domain>` requires a distribution in front.
-2. **One origin for `/api/*` and the S3 client later** — one domain, therefore no CORS.
-3. **Somewhere to attach OAC**, which is what makes the Function URL non-public at all.
+1. **Somewhere to attach OAC**, which is what makes the Function URL non-public at all. This one
+   is sufficient on its own.
+2. **One origin for `/api/*` and the S3 client later** — one hostname, therefore no CORS.
+3. **The option of a custom domain.** A Function URL is `https://<id>.lambda-url.us-east-2.on.aws`
+   and nothing can be aliased onto it, so `api.<domain>` would require a distribution in front.
+   No domain is being registered (§8), so this is a door left open rather than a reason.
 
 It buys no caching. Responses vary by `Authorization`, and the ETag/304 path below revalidates
 at the origin, so Lambda runs either way. CloudFront here is a pass-through with a real
@@ -205,11 +209,16 @@ nothing, but it is a component in the auth path and it belongs on the diagram. C
 current OAC behaviour — including how request bodies are signed for POST/PUT — before P1
 depends on it.
 
-**Cognito for identity.** 10,000 MAUs free *permanently* — not a 12-month tier. Managed login
-UI, standard JWTs, and Google/Apple available when wanted, though **phase 1 is email-only with
-no federated IdPs** (§5, §6). A small middleware layer is the entire user management story.
-Confirm which pricing tier carries both the free MAU allowance and the managed login UI before
-the cost model in §8 leans on it.
+**Cognito for identity, on the Lite tier.** All three things this design wants sit in one tier:
+Lite carries **10,000 MAUs free permanently** — AWS states the allowance "does not automatically
+expire at the end of your 12-month AWS Free Tier term" — plus managed login and social/SAML/OIDC
+federation. What Lite lacks is the *visual branding editor* for the login page, which is what
+Essentials adds at $0.015/MAU. Standard JWTs mean a small middleware layer is the entire user
+management story, and **phase 1 is email-only with no federated IdPs** (§5, §6).
+
+One number to carry forward if federation ever lands: on Essentials the free allowance for
+**SAML/OIDC** federation is 50 MAU, not 10,000. Google and Apple are social providers and are
+not subject to that, so a built-in social IdP is materially cheaper than a generic OIDC one.
 
 **Aurora DSQL for data.** See comparison below.
 
@@ -233,6 +242,38 @@ still finding its shape.
 first query of a session returns. For an app opened a few times a week, nearly every
 session eats that stall. Also lands at $3–10/mo, brushing the cost ceiling.
 
+**Why not DuckDB over files in S3:** genuinely tempting, for everything it deletes. Local
+development would be exact rather than an approximation of DSQL, foreign keys would come back,
+the migration runner would stop being special, the 3,000-row transaction cap would disappear, and
+S3 object versioning is a passable point-in-time story for free.
+
+It fails on writes, and not marginally. **DuckDB cannot open a database file on S3 for writing at
+all** — `ATTACH` over HTTP or S3 is read-only, and omitting `READ_ONLY` errors with *"Cannot open
+an HTTP file for both reading and writing."* So every write is GET-the-whole-database, mutate a
+local copy, PUT-the-whole-database. The only concurrency primitive left is a conditional PUT on
+the object's ETag, which serialises every write in the system against every other one — a
+reaction conflicts with an unrelated reveal on a different show — and rewrites the entire
+database to record a hundred bytes. Nor can a conflict simply be retried: the local copy is stale
+by then, so each write has to be replayable against freshly fetched state. That is a hand-rolled
+transaction log sitting underneath `reveal`, `left_at`, and `members_at`, which are the
+invariants this design is least willing to get wrong.
+
+**DuckLake is the sanctioned multi-writer answer, and it does not help here.** It requires a
+catalog database with real concurrency; its own documentation puts Postgres in that role and
+labels DuckDB and SQLite catalogs as suitable only for local proofs of concept. That is DSQL plus
+S3 plus a lakehouse format, to store a few tens of megabytes.
+
+Two smaller costs worth recording. `sqlx`'s compile-time query checking — listed above as a
+deciding advantage of writing this in Rust — has no DuckDB backend, so it would become runtime
+validation on the read path the type system was chosen to police. And DuckDB is a columnar
+analytics engine being asked to serve small point lookups with a high write-to-data ratio, which
+is the inverse of its design centre. Cost decides nothing: both are $0 at this scale.
+
+The trade, stated plainly, is *incidental complexity already designed around* for *essential
+complexity that would have to be invented*, landing on the write path where a bug is a lost
+`reveal` rather than a slow query. **The same objection applies to any single-writer, whole-file
+store**, SQLite on S3 included; the constraint is the storage shape, not DuckDB.
+
 **Why DSQL:** serverless distributed Postgres on a public IAM-authenticated endpoint — no
 VPC, no NAT, no connection pooling infrastructure. Scales to zero with *no* resume penalty.
 Free tier is 100k DPUs + 1 GB storage permanently. SQL ergonomics are retained, so the
@@ -242,10 +283,17 @@ complex discussion read stays one query.
 
 - **No foreign keys.** Referential integrity moves into a validation layer in the app.
 - **No triggers, no PL/pgSQL, no temp tables.** Use CTEs; put logic in the app.
-- **UUID primary keys throughout.** No sequences; DSQL partitions on key distribution.
-- **`CREATE INDEX ASYNC`** for index creation.
+- **UUID primary keys throughout.** DSQL partitions on key distribution, so a monotonically
+  increasing key concentrates writes on one partition. DSQL does support `CREATE SEQUENCE` and
+  `GENERATED … AS IDENTITY`; the choice here is about distribution, not availability.
+- **Index creation is always asynchronous.** `CREATE [UNIQUE] INDEX ASYNC` is the only form —
+  plain `CREATE INDEX` is unsupported. **Inline `UNIQUE` and `PRIMARY KEY` constraints in
+  `CREATE TABLE` are supported**, however, which keeps almost every constraint in §4 out of the
+  async path entirely. See §7 for what that buys the migration runner.
 - **Optimistic concurrency control.** Conflicting transactions return a serialization error
-  rather than blocking. The app needs retry logic around writes.
+  rather than blocking. The app needs retry logic around writes. Note that an async index going
+  active also updates the system catalog, and concurrent transactions touching the same
+  namespace at that moment can see a concurrency error.
 - **Transactions cap at 3,000 modified rows**, and DDL/DML cannot mix (one DDL statement
   per transaction). This shapes the migration runner and forces bulk progress writes to
   chunk — see §4.
@@ -259,17 +307,19 @@ complex discussion read stays one query.
 account            cognito_sub, email, display_name,
                    show_unrevealed_episode_titles, show_note_counts
 group              name, created_by
-membership         group_id, account_id, display_name, accent_color, sort_order, left_at
-watch_party        name
-watch_party_member watch_party_id, account_id, sharing_enabled
+membership         group_id, account_id, role, display_name (nullable), accent_color,
+                   left_at, removed_by (nullable)
 invite             group_id, token, created_by, expires_at, max_uses, uses, revoked_at
+watch_party        name, created_by
+watch_party_member watch_party_id, account_id, status, sharing_enabled
 
 title              tmdb_id, name, poster_path, status, tmdb_synced_at
 episode            title_id, tmdb_id, season_number, episode_number, name, air_date, still_path
 group_title        group_id, title_id
 
 post               episode_id, author_account_id, group_id (nullable),
-                   body, created_at, edited_at, offset_secs, reply_to_post_id
+                   body, created_at, edited_at, offset_secs,
+                   reply_to_post_id, parent_deleted_at
 reaction           post_id, group_id, account_id, emoji
 reveal             account_id, episode_id, mode, created_at
 watched_episode    account_id, episode_id, created_at
@@ -316,9 +366,16 @@ DEFERRED` is the usual escape, but it needs a unique *constraint* rather than a 
 which sits badly with the `CREATE INDEX ASYNC` rule in §7. Position is TMDB's to get right;
 identity is `tmdb_id`. The index is still wanted, because the season grid reads by it.
 
-Creating these interacts with the `CREATE INDEX ASYNC` rule in §7; confirm whether DSQL wants
-each one inline on `CREATE TABLE` or as a separate async unique index before writing the
-migrations.
+**Every one of these is declared inline on `CREATE TABLE`, as a column or table constraint.**
+DSQL supports inline `UNIQUE` and `PRIMARY KEY` there, and using them sidesteps the async index
+path completely: no `job_id` to wait on, no window in which the constraint is unenforced, and no
+exposure to the `INVALID`-index failure mode in §7 — which is at its nastiest for unique indexes,
+because a failed build still enforces uniqueness on writes while being unusable for reads. It is
+also ordinary Postgres, so these migrations run unmodified against the local test database.
+
+The consequence for §7's migration lint is that the sanctioned `ASYNC` rewrite applies only to
+the *non-unique* read indexes, of which this design has few. A unique index would only ever be
+created asynchronously if one had to be added to a table that already exists.
 
 ### The layering rule
 
@@ -328,30 +385,80 @@ Every table sits at exactly one of two layers, and the layer follows from a sing
 | Layer | Keyed on | Holds |
 | --- | --- | --- |
 | **Account** | `account_id` | Everything about watching: progress, reveals, timers, offsets. Authored posts. Spoiler-display preferences. Watch parties. |
-| **Membership** | `group_id` + `account_id` | Presentation only: display name, accent colour, sort order. Plus group-scoped conversation — replies and reactions. |
+| **Membership** | `group_id` + `account_id` | Presentation and standing: display name, accent colour, role. Plus group-scoped conversation — replies and reactions. |
 
 You watch an episode once, so watching is account-level. You may present differently to your
-roommates than to your coworkers, so presentation is membership-level.
+roommates than to your coworkers, so presentation is membership-level. Being an admin is
+membership-level for the same reason: it is a standing within one room, not a property of you.
 
 **Mismatched layers are what produced the redundancy this design originally had.** Keying
 progress on `membership_id` meant somebody in three *Star Trek* groups marked each episode
 watched three times, and could hold "revealed" in one group and "hidden" in another for an
 episode they had watched exactly once. When adding a layer, check it against the question above.
 
-### Membership, and the watch party
+### Membership: presentation and standing
 
-`account` is a login. `membership` is that account's presence in one group, and holds only
-presentation: display name override, accent colour, sort order.
+`account` is a login. `membership` is that account's presence in one group — how you appear
+there, and what you may do there.
 
-A `watch_party` is a persistent set of accounts who watch together on the same screen —
-couples, roommates, families. **Up to 10 members**, enforced in the app layer.
+**Presentation.**
 
-**A watch party is account-level, not group-scoped.** Your household is your household
-regardless of which group you are looking at. Scoping parties to groups would break under
-account-level progress: somebody in a roommate party in one group and a partner party in
-another would have a single solo viewing fan out to both, claiming two households watched
-an episode when one person did. A party renders inside any group's grid as one column
-merging whichever of its members belong to that group.
+- **`display_name` is nullable and falls back to `account.display_name`.** NULL means "use my
+  account name here": joining needs no naming step, renaming your account updates every group
+  where you never overrode it, and the override stays available for the group that knows you as
+  something else. Resolution is a `COALESCE` over a join the board read already performs. A
+  copied-on-join name would instead leave every existing group showing a stale value, with no
+  way to distinguish that from a deliberate override.
+- **`accent_color` holds a palette name, not a colour value.** The server keeps a fixed palette
+  of around a dozen colours chosen to stay legible in both light and dark; joining assigns the
+  first one unused in that group, reusing once the palette is exhausted. `PATCH /api/groups/:g/me`
+  accepts a palette name and nothing else. Free-form hex would carry no contrast guarantee —
+  somebody picks `#111111` and is invisible in dark mode — and keeping the palette finite makes
+  "distinct within a group" a cheap best-effort assignment rather than a constraint that can fail
+  a join.
+- **There is no `sort_order`.** Grid columns render as the caller first, then everyone else by
+  resolved display name. An earlier draft carried the column over from Outwatch, where it was a
+  hand-curated roster field; hand curation does not survive self-service groups, and the column
+  had no route and no owner. A derived order costs nothing and cannot go stale.
+
+**Roles.** `membership.role ∈ 'admin' | 'member'`. Creating a group seeds the creator's own
+membership as `admin`; `group.created_by` stays a provenance record and confers nothing, so
+ejecting or demoting a creator needs no special case.
+
+| Any member may | Only an admin may |
+| --- | --- |
+| Issue an invite | Remove another member, and re-admit one |
+| Leave the group | Promote a member to admin |
+| Write, reply, react | Delete the group |
+
+Inviting is deliberately *not* an admin power. Group access is invite-gated in every phase and an
+account in zero groups can see nothing (§6), so restricting who may invite buys no privacy — it
+only adds a bottleneck to the one action that makes a group useful.
+
+Two invariants keep a group from becoming unadministrable. Both are app-layer, like every other
+integrity rule here:
+
+- **A group always has at least one admin.** Demotion is *self-only* — an admin steps down
+  through `PATCH /api/groups/:g/me`, and the last one cannot. Admins deliberately cannot demote
+  each other: peers demoting peers is a race with no tiebreaker, because this design has no
+  owner sitting above them to resolve it.
+- **The last admin cannot leave while other members remain.** They must promote a successor or
+  delete the group first; the attempt otherwise fails. A sole admin who is also the sole member
+  leaves freely, and the group goes dormant — see below.
+
+### The watch party
+
+A `watch_party` is a persistent set of accounts who watch together on the same screen — couples,
+roommates, families. **Up to 10 active members**, enforced in the app layer. It is not a group and
+has nothing to do with privacy: it holds no boards, no posts, and no visibility rules. Its entire
+job is that people who watched an episode together tick it once between them.
+
+**A watch party is account-level, not group-scoped.** Your household is your household regardless
+of which group you are looking at. Scoping parties to groups would break under account-level
+progress: somebody in a roommate party in one group and a partner party in another would have a
+single solo viewing fan out to both, claiming two households watched an episode when one person
+did. A party renders inside any group's grid as one column merging whichever of its members
+belong to that group.
 
 **Progress is always per-account.** Sharing is a *write-time fan-out*, not a shared row:
 
@@ -371,6 +478,31 @@ Fan-out makes divergence natural and keeps every read per-account and simple.
 
 A watch party renders in a grid as one column with three states — all watched, some
 watched, none — rather than a single checkbox.
+
+**Joining requires consent, because a party exposes your progress to it.**
+`POST /api/watch-parties/:w/invites` takes an email address and always answers 202, so the route
+never becomes an oracle for which accounts exist (§5). If the address resolves, a
+`watch_party_member` row lands with `status = 'pending'`; the invitee sees it on `GET /api/me` and
+accepts or declines. Only `status = 'active'` rows take part in fan-out or count against the
+ten-member cap.
+
+Addressing the invite to an email rather than minting a token is the same call §6 makes for
+phase-B signup invites, and for the same reasons — but here it also spares two people who live in
+the same house a link-passing ritual. Restricting invitees to accounts you already share a *group*
+with was the alternative, and it fails the obvious case: your partner is your partner before the
+two of you happen to join the same discussion group.
+
+**`watch_party.created_by` may remove any member; anyone may remove themselves.** There is
+deliberately no role column here. The bus-factor argument that ruled a bare `created_by` out for
+groups barely applies to a household of at most ten: if the creator vanishes, the recovery is to
+leave and re-form the party, which costs nothing, because progress is per-account and never lived
+in the party to begin with. A group cannot be re-formed that cheaply — its conversation is inside
+it.
+
+**Leaving a party is a hard delete**, unlike leaving a group. Nothing references
+`watch_party_member` historically: fan-out happens at write time, so every past write is already
+materialised as ordinary per-account rows. There is no provenance to preserve, so there is no
+`left_at` here and no reason for one.
 
 ### Leaving a group is a soft delete
 
@@ -400,6 +532,43 @@ That rule gives the three behaviours that matter:
 - **Rejoining clears `left_at`** on the existing row rather than inserting a second one.
   `(group_id, account_id)` is unique. Display name, accent colour, and identity survive, and
   everything written while away becomes visible — consistent with joining always backfilling.
+  **`role` does not survive: a rejoin lands as `member`.** Otherwise a removed admin who kept
+  or was handed an invite link would walk back in holding the power to remove the people who
+  removed them.
+
+**Being removed is not the same as leaving, and `left_at` alone cannot tell them apart.**
+`DELETE /api/groups/:g/members/:a` sets `left_at` *and* `removed_by`, naming the acting admin.
+While `removed_by` is set, `POST /api/invites/:token/accept` refuses for that account.
+
+Without that, removal would not really be a control. Invites are issuable by any member (§4), so
+a well-meaning one could undo an ejection immediately — and worse, an unexpired token the removed
+person already holds would let them readmit themselves, since accepting an invite is exactly the
+operation that clears `left_at`. Re-admission is therefore an explicit admin action that clears
+`removed_by`, which also keeps a mistaken removal recoverable.
+
+**`left_at` is lossy across repeated leave and rejoin, and that is accepted.** One column cannot
+represent two gaps, so after a second departure, notes written during an *earlier* absence become
+visible: the rule is a single upper bound, and rejoining moved it. The alternative is a
+membership-interval table and a range containment check on every board read. Given that joining
+already backfills the entire back catalogue by design, a slightly larger backfill is consistent
+with the model rather than surprising — but it is written down here rather than discovered later.
+
+**An emptied group persists; leaving never destroys it.** When the last member leaves, the
+`group` row, its scoped posts, and its memberships all stay. Every route 404s because nobody
+holds a live membership, so it is unreachable rather than gone. This matches the soft-delete
+posture everywhere else and costs a handful of rows. Deleting on last-leave would instead let one
+person clicking *Leave* destroy every group-scoped note and reply in the room — precisely the
+erasure `left_at` exists to prevent.
+
+Two things follow. **Admins can delete a group explicitly** (`DELETE /api/groups/:g`), which is
+the deliberate, authorised version of that destruction and removes the group's memberships,
+invites, `group_title` rows, scoped posts, replies, and reactions. Portable posts survive: they
+belong to their authors and to episodes, and only lose one place they were visible. And
+**dormant groups are eventually swept**: a group with no live membership for ~90 days is dropped
+by the scheduled Lambda that already prunes invites and sessions (§4, growth and pruning). The
+delay is not itself a recovery path — with no live membership nobody can issue an invite, so
+undoing an accidental last departure is an out-of-band fix. It is a hedge against a single click
+destroying a room's history irreversibly.
 
 ### Reveal is a mode, not a boolean
 
@@ -412,7 +581,9 @@ A binary reveal flag would have precluded planned future behaviour: **posts appe
 sync with the watch timer, auto-revealing as you watch**. Synced reveal is not "open", it
 is "open up to where I am".
 
-- `open` — every post on the board is visible. Marking an episode watched writes this.
+- `open` — every post on the board is visible. Marking an episode watched writes this. The API
+  also accepts `hidden`, which is not a stored value: it deletes the row, since absence *is*
+  hidden. Expressing the retraction as a mode keeps one route for the whole state machine.
 - `synced` — visible posts are those whose *corrected* offset is at or behind the reader's
   own corrected position. **A post is shifted by the correction of whoever wrote it, not by
   the reader's:**
@@ -487,6 +658,34 @@ The residual leak is content, not structure: a portable note whose body referenc
 group's conversation ("I agree with what Sarah said") carries that across. Nothing structural
 can prevent it, and the words are the author's own.
 
+### Deleting a post detaches its replies
+
+`DELETE /api/posts/:p` is a **hard delete**, and it applies in every group the post reached. No
+tombstone, no `[deleted]` placeholder, and no `deleted_at` predicate threaded through every read
+path and through `members_at` forever. When you delete your words, they leave.
+
+What must not leave with them is anybody else's. So the delete does two things to each reply
+pointing at that post:
+
+- **`reply_to_post_id` → `NULL`**, so the reply becomes an ordinary top-level note rather than a
+  pointer into nothing. This is Outwatch's behaviour, in `migrations/0007`.
+- **`parent_deleted_at` → now**, so it can still render as an answer to a note that is gone.
+
+**`parent_deleted_at` is its own column rather than a reuse of `edited_at`.** The two describe
+different events and both can be true of one note. `edited_at` means the author rewrote the body;
+stamping it on a detach would report an edit that never happened, and once the author really does
+edit, the two become indistinguishable. Leaving `reply_to_post_id` pointing at the deleted id was
+the other alternative and is worse: with no foreign keys nothing would ever clean it up, and an
+unresolvable parent is precisely how §5 renders a *locked* parent — so a note you cannot see yet
+and a note that no longer exists would look the same.
+
+Cascading the delete down to the replies was rejected outright. It would let one person's delete
+destroy other people's words, which is the erasure the rest of this section is built to prevent.
+
+Editing is unaffected: `PATCH /api/posts/:p` stamps `edited_at` and freezes `created_at`,
+`offset_secs`, and `reply_to_post_id`, so an edit can neither move a note on the timeline nor
+re-point its quote.
+
 ### Progress is per-episode
 
 Outwatch tracked seasons and derived episode reveals. With arbitrary shows — including ones
@@ -499,15 +698,46 @@ read the board". Watching writes both; revealing writes only the reveal. Collaps
 would lose the distinction between a board opened out of impatience and an episode actually
 watched.
 
+**Both are explicit two-way toggles, and neither retracts the other.** `PUT /api/episodes/:e/watched`
+takes `{watched: bool}` and `PUT /api/episodes/:e/reveal` takes `{mode}` including `hidden` — the
+same argument §7 makes for Outwatch's explicit `on` over a toggling reaction endpoint, which is
+that a toggle is not idempotent and therefore cannot be retried safely under optimistic
+concurrency.
+
+Marking watched still writes both. **Un-marking writes only the watched half**, and the asymmetry
+is the honest one: `reveal` records that you read the board, and un-watching cannot unread it.
+Retracting it automatically would mean that marking an episode watched weeks after you
+deliberately opened its board, then correcting a misclick on the watched flag, silently re-locks a
+board you have already read. A misclick in the other direction stays fully recoverable, because
+re-hiding is its own one-click action rather than a side effect of anything.
+
+**Episode order is `(season_number, episode_number)`**, with season 0 sorting first. This is the
+canonical order for the grid and for `POST /api/titles/:t/watched-through`, which marks every
+episode at or before its target in that order **except**:
+
+- **Season 0.** Specials are skipped by any range and marked individually. Nobody saying "I'm
+  through season 3" means "and all the specials", and TMDB's specials are frequently
+  out-of-continuity anyway.
+- **Anything with a null or future `air_date`.** You cannot have watched an episode that has not
+  aired, and a show mid-run would otherwise mark its unaired remainder watched forever.
+
+Multi-part episodes need no handling: TMDB rows them separately, so they are ordinary episodes.
+Air-date ordering was considered and rejected — null air dates make the order partial, TMDB's
+dates are often regional or wrong, and the grid renders by number regardless. The P1 hand-seed
+(§10) commits to this convention, so P2's ingest has to preserve it rather than invent it.
+
 ### Bulk writes must chunk
 
-"Mark this whole series watched" on a 250-episode show, for a 10-member watch party, across
-`watched_episode` + `reveal`, is 5,000 rows — over DSQL's 3,000-row transaction cap. Bulk
-progress writes batch by episode range and commit per chunk.
+"Mark this whole series watched" writes to both `watched_episode` and `reveal`, so it is two rows
+per episode, and fan-out multiplies that by the sharing members of the author's watch party. A
+250-episode show for a 10-member party is 5,000 rows — over DSQL's 3,000-row transaction cap
+before the series is even a long one. Bulk progress writes batch by episode range and commit per
+chunk.
 
 Account-level progress helps here rather than hurting: the row count no longer multiplies by
 how many groups discuss the title. Somebody in three *Star Trek* groups writes one set of
-rows, not three.
+rows, not three. The remaining multiplier is party size, which is capped at ten — so the worst
+case is bounded and known, which is what makes fixed-size chunking sufficient.
 
 ### Growth and pruning
 
@@ -532,7 +762,8 @@ A running session needs a cap — if `now - running_since` exceeds a sane episod
 logic and belongs in the shared session helper, not in a pruning job.
 
 Cleanup runs lazily when an account's sessions are touched, plus a sweep in the scheduled
-Lambda that already runs for the TMDB refresh. No new infrastructure.
+Lambda that already runs for the TMDB refresh — the same job that prunes spent invites and
+dormant groups. No new infrastructure.
 
 | Table | Growth | Prunable? |
 | --- | --- | --- |
@@ -540,6 +771,7 @@ Lambda that already runs for the TMDB refresh. No new infrastructure.
 | `invite` | Grows per invite issued | **Yes** — drop expired/revoked after a grace period |
 | `reveal`, `watched_episode` | accounts × episodes-in-catalog | No, but bounded and meaningful |
 | `watch_offset` | Same bound, sparse — only actual corrections | No, but tiny |
+| `group`, `membership` | Grows per group created, never per use | **Dormant only** — a group with no live membership for ~90 days |
 | `post`, `reaction` | Grows with use — but that is the product | User-deletable; reactions capped per post |
 | `title`, `episode` | Bounded by what groups actually discuss | **No — append-only once referenced** |
 
@@ -612,26 +844,43 @@ not to the room they are discussing it in.
 | --- | --- |
 | `GET /api/me` | Account + the groups I am in |
 | `PATCH /api/me` | `display_name`, `show_unrevealed_episode_titles`, `show_note_counts` |
-| `POST /api/groups` | Create a group |
+| `POST /api/groups` | Create a group — creator becomes its first admin |
 | `GET /api/groups/:g` | Members, watch parties, titles |
-| `PATCH /api/groups/:g/me` | My membership: `display_name`, `accent_color` |
-| `POST /api/groups/:g/invites` / `DELETE /api/invites/:token` | Issue / revoke |
+| `DELETE /api/groups/:g` | Delete — **admin only** |
+| `PATCH /api/groups/:g/me` | My membership: `display_name`, `accent_color`, and self-demotion from `admin` |
+| `PATCH /api/groups/:g/members/:a` | `{role}` promotes to admin; `{removed: false}` re-admits. **Admin only** |
+| `DELETE /api/groups/:g/members/:a` | Remove someone — **admin only**; sets `left_at` and `removed_by` |
+| `POST /api/groups/:g/invites` / `DELETE /api/invites/:token` | Issue / revoke — any member |
 | `POST /api/invites/:token/accept` | Join — the only way in |
 | `DELETE /api/groups/:g/me` | Leave — soft delete, sets `left_at` |
 | `POST /api/watch-parties` | Create — account-level, not group-scoped |
-| `PATCH /api/watch-parties/:w/members/me` | `sharing_enabled` — the business-trip toggle |
+| `POST /api/watch-parties/:w/invites` | `{email}` — always 202; creates a `pending` member if it resolves |
+| `PATCH /api/watch-parties/:w/members/me` | `{status}` accept/decline; `{sharing_enabled}` — the business-trip toggle |
+| `DELETE /api/watch-parties/:w/members/:a` | Leave, or removal by `created_by`. Hard delete |
 | `GET /api/catalog/search?q=` | Server-side TMDB proxy |
 | `POST /api/groups/:g/titles` `{tmdb_id}` | Ingest skeleton + attach |
-| `GET /api/groups/:g/titles/:t` | Season grid: my progress, reveal state, all columns |
-| `GET /api/groups/:g/episodes/:e/posts` | The board — reveal-filtered, portable + scoped |
+| `GET /api/groups/:g/titles/:t` | Season grid: my progress, reveal state, per-episode note floor, all columns |
+| `GET /api/groups/:g/episodes/:e/posts` | The board — reveal-filtered, portable + scoped, paged |
 | `POST /api/groups/:g/episodes/:e/posts` | `{body, reply_to_post_id, scope}` — see below |
 | `PATCH` / `DELETE /api/posts/:p` | Edit / delete own — applies in every group it reaches |
 | `PUT /api/groups/:g/posts/:p/reactions` | `{emoji, on}` — group-scoped; emoji in body, not path (astral chars) |
-| `PUT /api/episodes/:e/watched` | Mark one — account-scoped |
+| `PUT /api/episodes/:e/watched` | `{watched}` — account-scoped |
 | `POST /api/titles/:t/watched-through` | Bulk, chunked per §4 — account-scoped |
-| `POST /api/episodes/:e/reveal` | `{mode}` — account-scoped |
+| `PUT /api/episodes/:e/reveal` | `{mode: open\|hidden}` — account-scoped |
 | `POST /api/episodes/:e/timer` | `{action: start\|pause\|resume}` — account-scoped |
 | `PUT /api/episodes/:e/offset` | `{adjust_secs}` — account-scoped |
+
+**Role changes are split across two routes on purpose.** `PATCH /api/groups/:g/members/:a` only
+ever *promotes*, and `PATCH /api/groups/:g/me` is the only way to stop being an admin. That
+mirrors the §4 invariants directly: an admin cannot demote a peer, and the last admin cannot
+demote themselves or leave while others remain — a 409 in both cases, since the request is
+well-formed and the group's state is what rejects it. The same route carries re-admission,
+because clearing `removed_by` is the other thing only an admin may do to somebody else's
+membership.
+
+**Both watched and reveal are `PUT` with an explicit body**, so every progress write is
+idempotent and therefore safe to retry under the serialization conflicts §7 describes. There is
+no toggle endpoint anywhere in this API.
 
 **Post creation keeps `:group_id` in the path even though a portable post has no group.**
 The group supplies the authorization check, scopes a reply, and resolves `scope`:
@@ -657,6 +906,20 @@ visible = { p : p.episode_id = e AND p.group_id IS NULL
 ```
 
 filtered by the caller's own `reveal` row for `e`. Reactions are loaded for `(post, g)` only.
+
+**The board is one flat chronological list, ordered by `(created_at, id)` ascending.** Replies
+are not nested: `reply_to_post_id` renders as a quote of its parent, so a reply may point at
+another reply and "depth" never becomes a rendering question. Nesting would have bought a
+familiar shape at the cost of recursive assembly, a cycle guard, and an arbitrary cap that is
+wrong the first time somebody wants to answer an answer. Oldest-first is the only defensible
+order for a discussion read alongside an episode, and it is the order `synced` reveal will need
+in P5.
+
+**Paged with a keyset cursor on `(created_at, id)`.** The sort key is total — `created_at` alone
+is not, since two notes can share a millisecond — so the cursor is just the last row's pair, and
+paging cannot skip or repeat a note as the board grows underneath it. Offset pagination would do
+both. The response carries an opaque cursor rather than the pair itself, so the encoding stays
+free to change.
 
 **`members_at` is evaluated at the post's creation time, not at read time**, and that is
 load-bearing. Evaluating current membership instead would drop a departed author's portable
@@ -686,11 +949,14 @@ A locked board is not an empty response. Two things survive the gate, and both a
 - **Your own posts, always.** You can write to a board before revealing it, so you can have
   notes on an episode you have not opened. Hiding your own words from you is a bug, not a gate
   — the gate exists to keep *other people's* observations away from you.
-- **The distinct authors who have written there.** This is what tells you whether opening the
-  board is worth it, and it is the same call Outwatch made. Author identity resolves through the
-  viewing group's `membership` as everywhere else, and the list runs through `members_at` like
-  the posts do — so a locked board names only authors whose posts you would actually see once
-  it opened.
+- **The distinct *other* authors who have written there.** This is what tells you whether opening
+  the board is worth it, and it is the same call Outwatch made. Author identity resolves through
+  the viewing group's `membership` as everywhere else, and the list runs through `members_at` like
+  the posts do — so a locked board names only authors whose posts you would actually see once it
+  opened. **You are excluded from it.** Your own notes already render right there, so naming
+  yourself is redundant, and excluding yourself gives the list a sharper meaning: empty means
+  "nothing here you have not already seen", which is exactly the question the floor exists to
+  answer.
 
 Nothing else does. No bodies, no reactions, no timestamps from other authors.
 
@@ -746,6 +1012,12 @@ The floor is therefore the author list rather than a boolean. That is a stronger
 earlier draft allowed, and it is the right one: names are what make the count actionable, and a
 count without them is both less useful and barely less revealing.
 
+**Both are computed over the same set: posts you would see on opening, minus your own.** So both
+run through `members_at` and both differ per viewer, and both live on the season grid
+(`GET /api/groups/:g/titles/:t`) as well as the board, because the grid is where you decide what
+to open. Counting your own notes would make "1 note" mean either "one stranger wrote here" or
+"that was me", resolvable only by opening the board — which defeats the point of a floor.
+
 ## 6. Abuse and Cost Protection
 
 ### Framing: private-by-default already did most of the work
@@ -753,7 +1025,8 @@ count without them is both less useful and barely less revealing.
 There is no public surface. No open discussion, no discovery, no user search, groups
 reachable only by invite. This eliminates spam, stranger harassment, and scraping **by
 construction rather than by controls**. What remains is an insider problem — someone you
-invited behaving badly — which is solved socially, by removing them.
+invited behaving badly — which is solved socially, by removing them: `DELETE
+/api/groups/:g/members/:a`, admin-only, and a group always has an admin able to run it (§4).
 
 Most conventional abuse tooling is therefore genuinely deferrable. Four things are not.
 
@@ -786,9 +1059,11 @@ cannot weaken it. That is what makes the progression below safe to defer rather 
 being left open.
 
 **Phase A (P1): `AllowAdminCreateUserOnly`, and nothing else.** Accounts are provisioned by
-hand with `admin-create-user`. No pre-signup trigger, no post-confirmation trigger, no admin
-route, no `is_admin` column — for a group this size that is minutes per year, and each of those
-is easier to add later than to remove. `account` rows are created **lazily by the auth
+hand with `admin-create-user`. No pre-signup trigger, no post-confirmation trigger, no
+service-administrator route, and nothing on `account` marking one — for a group this size that is
+minutes per year, and each of those is easier to add later than to remove. (`membership.role` in
+§4 is unrelated: it is standing inside one group, and confers nothing over the service or over
+who may hold an account.) `account` rows are created **lazily by the auth
 middleware**: a valid JWT bearing an unknown `cognito_sub` inserts one from the token's `sub`
 and `email`. That keeps `account` in sync with Cognito without a trigger, and it is the same
 code path phases B and C need, so it is written once.
@@ -872,9 +1147,11 @@ three attempts, then a 409.
 
 That is only safe on idempotent transactions, which sorts the write paths in two:
 
-- **Naturally idempotent, retry freely** — reveals, `watched`, reactions, watch-party
-  fan-out. (Outwatch's choice to make `PUT .../reactions` take an explicit `on` rather than
-  toggling pays off directly here.)
+- **Naturally idempotent, retry freely** — reveals, `watched`, reactions, watch-party fan-out,
+  role changes, membership removal. Every one of these is a `PUT` or a `PATCH` carrying the
+  desired state rather than a toggle, which is what makes them retryable at all. (Outwatch's
+  choice to make `PUT .../reactions` take an explicit `on` rather than toggling pays off directly
+  here.)
 - **Not idempotent** — timer actions (`start` zeroes the session) and post creation. Retry
   after a *failed* transaction is still safe, since nothing committed. The risk is only
   retry after an **ambiguous** failure such as a network timeout after commit.
@@ -882,7 +1159,9 @@ That is only safe on idempotent transactions, which sorts the write paths in two
   delete. If it bites, a client-supplied idempotency key fixes it with no schema change.
 
 Conflict-prone paths to watch: fan-out to a 10-member watch party, reactions on a busy post,
-and simultaneous timer ticks.
+simultaneous timer ticks, and chunked bulk progress writes. Separately, a migration's async index
+going active can surface a conflict in unrelated transactions touching that namespace (§3), so
+the retry wrapper matters during deploys and not only under user load.
 
 ### Status conventions
 
@@ -915,6 +1194,12 @@ MySQL was considered and **rejected**. The two gaps are different kinds of probl
   two, and no lint can reconcile that — it is a translation, not a subset. The migration
   runner handles it as a single sanctioned rewrite (see below), and the lint enforces that
   it stays the only one.
+
+  The exception is narrower than it first looks. DSQL accepts inline `UNIQUE` and `PRIMARY KEY`
+  constraints in `CREATE TABLE`, and §4 declares every uniqueness constraint that way, so the
+  rewrite only ever touches the handful of non-unique read indexes. Those are also the indexes
+  whose absence degrades a query rather than breaking a guarantee, which is the safer half of the
+  divergence to be carrying.
 - **MySQL → DSQL is a *translation* gap.** Different protocol and dialect
   (`ON DUPLICATE KEY UPDATE` vs `ON CONFLICT`, different `RETURNING`, UUID storage, JSON
   functions, collation and NULL semantics), no subset relationship, and nothing can lint for
@@ -935,12 +1220,14 @@ default, which is exactly what DSQL forbids.
   documented as the only permitted divergence, enforced by the lint above.
 - **Wait for async index builds before marking a migration applied.** `CREATE INDEX ASYNC`
   returns a `job_id` immediately and builds in the background; `sys.wait_for_job(job_id)`
-  blocks until it finishes. Without this, migration N+1 can run against an index that does
-  not exist yet — AWS explicitly recommends the wait during schema migration.
+  blocks the session until it finishes and returns a boolean. Without this, migration N+1 can
+  run against an index that does not exist yet — AWS explicitly recommends the wait during
+  schema migration.
 - **A failed index build leaves the index `INVALID`, not absent.** Fail loudly and require a
-  manual `DROP INDEX`; proceeding silently leaves a unique index that enforces constraints
-  while being unusable for reads. Note `sys.jobs` purges completed and failed rows after 30
-  minutes, so it is not an audit log.
+  manual `DROP INDEX`; proceeding silently leaves a unique index that, in AWS's words, keeps DML
+  "subject to uniqueness constraints until you drop the index" while remaining unusable for
+  reads. Note `sys.jobs` purges completed and failed rows after 30 minutes, so it is not an audit
+  log — the runner must read a job's status while it still exists, not afterwards.
 
 ### Migrations run from CI, before the code deploy
 
@@ -982,8 +1269,10 @@ CI's credentials ever become a real concern rather than a theoretical one.
 ### Test strategy
 
 - **Unit, no database** — the highest-value tier. Session offset computation including the
-  4-hour running cap, reveal filtering, fan-out target selection under `sharing_enabled`,
-  and bulk chunking are all pure functions, and all are logic where a bug is a spoiler leak.
+  4-hour running cap, reveal filtering, `members_at` evaluation at post-creation time, the
+  watched-through range (season 0 and unaired episodes excluded), fan-out target selection under
+  `sharing_enabled`, and bulk chunking are all pure functions, and all are logic where a bug is a
+  spoiler leak or silent data loss.
 - **Integration against stock Postgres** via testcontainers, paired with the migration lint
   above so dialect drift fails in CI rather than at deploy.
 - **Smoke suite against a real dev DSQL cluster in CI**, catching what the lint cannot.
@@ -999,27 +1288,38 @@ caller's own posts and the author list both survive it by design (§5). A test a
 locked board returns nothing would be asserting the wrong invariant, and the two exceptions are
 exactly where a leak would hide — so each needs its own case. The author list in particular must
 be filtered through `members_at`, or a locked board names people whose posts the caller could
-not see even after opening it.
+not see even after opening it; and it must exclude the caller, or the floor stops meaning what
+§5 says it means.
 
 ## 8. Cost Model
 
-At the stated scale, essentially just a Route 53 hosted zone at $0.50/mo:
+At the stated scale, **$0/month** — every component sits inside a permanent free tier, and there
+is no domain to pay for:
 
 | Service | Free allowance | Expiry |
 | --- | --- | --- |
 | CloudFront | 1 TB egress, 10M requests/mo | Always |
 | Lambda | 1M requests, 400k GB-s/mo | Always |
 | Aurora DSQL | 100k DPU, 1 GB storage/mo | Always |
-| Cognito | 10,000 MAU/mo | Always |
+| Cognito (Lite tier) | 10,000 MAU/mo | Always |
 | Lambda Function URLs | No per-request charge | n/a |
-| Route 53 hosted zone | — | $0.50/mo |
+| CloudFront Functions | ~$0.10/M — the `Authorization` forwarder (§3) | n/a |
+| S3 (code bucket, Terraform state) | 5 GB | 12 months, then pennies |
 
 Beyond free tier: DSQL is $8.00/M DPU and $0.33/GB-month (us-east-1/us-east-2). This holds
 until well past a few hundred users.
 
-**The domain is not chosen yet, and nothing waits on it.** The hosted zone and the us-east-1
-ACM certificate are the only things it gates, so P1 deploys against CloudFront's default
-`*.cloudfront.net` hostname and gains an alias whenever a name is picked.
+**No domain is being registered, and nothing in the design needs one.** The service runs on
+CloudFront's default `*.cloudfront.net` hostname. That removes the only recurring charge in the
+estate — a Route 53 hosted zone at $0.50/mo — along with the us-east-1 ACM certificate and the
+cross-region wrinkle §3 notes about it.
+
+Adding a domain later is additive and small: register it, create the hosted zone, issue the
+certificate in us-east-1, and add an alias plus `viewer_certificate` to the existing distribution.
+Nothing else moves, because the distribution, the origin, OAC, and the auth path are all
+independent of the hostname. **The name "Spoilies" is settled regardless** — it is already the
+repo, the AWS account, the IAM role names, and the S3 key, and none of that depends on owning the
+matching domain.
 
 ### Free tier is aggregated across the organization
 
@@ -1154,12 +1454,16 @@ Small, but strictly first — P1's deploy step depends on all of it.
 
 ### P1 — Foundation and the spoiler gate
 
-Cognito in phase-A posture — `AllowAdminCreateUserOnly`, email only, no triggers and no
-federated IdPs (§6) — with `account` rows created lazily by the auth middleware; `group`,
-`membership`, `invite`; `post` (portable and scoped); `reveal` in `open` mode only;
-`watched_episode`; the board read with the gate applied. Plus the infrastructure: DSQL wiring,
-migration runner, CloudFront + OAC + the `Authorization` forwarding function, and the Lambda
-deploy.
+Cognito on the Lite tier in phase-A posture — `AllowAdminCreateUserOnly`, email only, no triggers
+and no federated IdPs (§6) — with `account` rows created lazily by the auth middleware; `group`,
+`membership` (including `role`), `invite`; `post` (portable and scoped); `reveal` in `open` mode
+only; `watched_episode`; the board read with the gate applied, ordered and paged. Plus the
+infrastructure: DSQL wiring, migration runner, CloudFront + OAC + the `Authorization` forwarding
+function, and the Lambda deploy.
+
+`role` ships here rather than later even though a first group has one member. It is a column on a
+table P1 already creates, and the alternative is a migration plus a backfill deciding who was
+retroactively in charge of every existing group.
 
 Note that `invite` ships here for **group membership**, which is invite-only in every phase —
 it is not yet involved in signup.
@@ -1181,13 +1485,15 @@ mechanism.
 
 ### P3 — Conversation depth
 
-Replies, reactions, edits, deletes. Note counts and the display preferences that govern them.
+Replies, reactions, edits, deletes — including the detach-and-mark rule for `parent_deleted_at`.
+Note counts and the display preferences that govern them.
 
 ### P4 — Watch parties and timers
 
-`watch_party` with fan-out and the `sharing_enabled` toggle; `watch_session`, `watch_offset`,
-and `post.offset_secs`. The first phase with real concurrency exposure, so the OCC retry
-work in §7 lands here.
+`watch_party` with the email-addressed invite, the pending/active consent flow, fan-out, and the
+`sharing_enabled` toggle; `watch_session`, `watch_offset`, and `post.offset_secs`, with the
+4-hour running cap and the lazy session cleanup from §4. The first phase with real concurrency
+exposure, so the OCC retry work in §7 lands here.
 
 ### P5 — Synced reveal
 
@@ -1200,51 +1506,36 @@ the workarounds are to scope a note at creation, or to delete and rewrite it.
 
 ## 11. Open Questions
 
-### Product decisions the schema depends on
+The product decisions this section used to hold are resolved and now live in the sections they
+belong to: group roles and membership presentation in §4, post deletion and reply shape in §4,
+un-watch, episode ordering, and watch-party consent in §4, board paging and the note floor in §5.
+What remains is verification, and none of it changes a design decision — each answer changes an
+implementation.
 
-- **Group roles.** §6 says insider abuse is "solved socially, by removing them", but §5 has no
-  route to remove another member and no notion of who may issue invites, despite
-  `group.created_by` existing. Also unresolved: what happens to a group when the last member
-  leaves.
-- **Post deletion.** `DELETE /api/posts/:p` — hard delete or tombstone? A hard delete leaves
-  replies dangling under a missing parent, which is the failure `left_at` exists to prevent.
-- **Watch party membership.** No route adds, removes, invites, or accepts. Joining a household
-  exposes your progress to it, so it needs consent.
-- **Un-watch and un-reveal.** `PUT /api/episodes/:e/watched` takes no body; §7's own argument
-  for Outwatch's explicit `on` over a toggle applies here too. If an episode can be un-watched,
-  does that retract the reveal?
-- **Board read: ordering, pagination, and reply depth.** None are specified. Can a reply have a
-  reply?
-- **Note-count floor.** Computed through `members_at`, so it differs per viewer — and does it
-  count your own notes? If you are the only author, "has notes" tells you nothing.
-- **`membership.sort_order` has no route and no owner.** `PATCH /api/groups/:g/me` covers only
-  `display_name` and `accent_color`. Is ordering self-set (you choose your column position for
-  everyone) or viewer-set? Same question for `accent_color`: auto-assigned on join, unique
-  within a group, validated format? And is `membership.display_name` nullable, falling back to
-  `account.display_name`?
-- **`left_at` is lossy across repeated leave/rejoin.** One column cannot represent two gaps, so
-  notes written during an earlier absence become visible after a later departure. Probably
-  acceptable given always-backfill, but it should be stated rather than discovered.
-- **Episode ordering conventions.** Season 0 / specials, unaired episodes with null air dates,
-  and multi-part episodes all need a defined order before `POST /api/titles/:t/watched-through`
-  means anything — and the P1 hand-seed has to commit to that convention.
+### Verified, and what it settled
 
-### To verify before depending on
+- **Cognito tier: Lite.** It carries the 10,000 permanently-free MAUs, managed login, and social
+  federation together, so §3's assumptions sit in one tier. What Lite lacks is the visual branding
+  editor, which Essentials adds at $0.015/MAU. If federation ever lands, prefer a built-in social
+  provider: on Essentials the free allowance for **SAML/OIDC** federation is 50 MAU, not 10,000.
+- **DSQL index mechanics.** `CREATE [UNIQUE] INDEX ASYNC` is the only index form;
+  `sys.wait_for_job(job_id)` blocks and returns a boolean; a failed build leaves an `INVALID`
+  index that still enforces uniqueness on writes; `sys.jobs` purges after 30 minutes. Crucially,
+  inline `UNIQUE` and `PRIMARY KEY` in `CREATE TABLE` are supported, which keeps every constraint
+  in §4 out of the async path (§4, §7). DSQL also supports sequences and identity columns now —
+  UUID keys remain the choice, for distribution rather than necessity.
+- **Federated sign-in versus `AllowAdminCreateUserOnly`** — supported by scope rather than by an
+  explicit statement. The API reference defines the flag against exactly one operation ("users can
+  register themselves and create a new user profile with the `SignUp` operation"), and the
+  pre-sign-up trigger documentation describes federated first sign-in as a separate creation path.
+  So the flag does not gate federated users. This no longer needs to be load-bearing: P1's
+  no-federation posture is correct whichever way it resolves, so the empirical check moves to
+  whichever phase enables federation.
 
-- **Cognito tier.** The design assumes 10,000 MAU free *and* the managed login UI *and* (later)
-  Google/Apple. Since the Lite/Essentials split those may not all sit in one tier.
-- **That federated sign-in creates a pool user regardless of `AllowAdminCreateUserOnly`.** §5
-  and §6 state this as fact and the entire phase-1 posture rests on it — it is the reason
-  federation is deferred rather than enabled now. It matches AWS's documented behaviour, but
-  nothing else in the design carries this much weight on an unverified claim.
-- **CloudFront OAC to a Lambda Function URL** — the `Authorization` collision and how request
-  bodies are signed for POST/PUT (§3).
-- **DSQL specifics** — `sys.wait_for_job`, `INVALID` index behaviour, and how unique indexes
-  are created given the `ASYNC` rule (§4, §7).
-- **`sqlx` offline mode.** Compile-time query checking needs a live Postgres at build time or a
-  committed `.sqlx` cache; CI cross-compiles to `aarch64-unknown-linux-musl` with no database.
-  Worth an early spike alongside the DSQL SQLx connector's TLS stack on musl/ARM.
+### Still to verify, in the phase that depends on it
 
-### Naming
-
-- Final product name — "Spoilies" is a working name.
+- **CloudFront OAC to a Lambda Function URL** (§3) — the `Authorization` collision and how
+  request bodies are signed for POST/PUT. Needs a deployed distribution to answer honestly; P1.
+- **`sqlx` offline mode** — compile-time query checking needs a live Postgres at build time or a
+  committed `.sqlx` cache, and CI cross-compiles to `aarch64-unknown-linux-musl` with no
+  database. Worth an early spike alongside the DSQL SQLx connector's TLS stack on musl/ARM; P0.
