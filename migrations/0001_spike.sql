@@ -1,1 +1,0 @@
-CREATE TABLE spike (id INT PRIMARY KEY, name TEXT NOT NULL);
