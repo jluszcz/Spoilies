@@ -5,3 +5,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+sqlx = { version = "0.9", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls-ring",
+    "postgres",
+    "uuid",
+    "chrono",
+    "macros",
+] }
+aurora-dsql-sqlx-connector = { version = "0.2.2", features = ["pool", "occ"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
