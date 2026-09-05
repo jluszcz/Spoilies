@@ -42,6 +42,24 @@ aarch64-unknown-linux-musl` to the commands above.
 
 There is no packaging or deployment yet; those land with the implementation.
 
+## Infrastructure
+
+Spoilies lives in its own AWS account in `us-east-2`, inside the existing organization, so it can be
+separated later without untangling anything. The account topology and its reasoning are in §9 of the
+design spec.
+
+### Bootstrap (once per account)
+
+Terraform's state bucket cannot be a resource in the configuration it stores, so it is created by a
+script rather than by Terraform:
+
+```sh
+./scripts/bootstrap-tf-state.sh
+```
+
+Idempotent, and safe to re-run to reconcile the bucket's settings. It expects an `AWS_PROFILE` that
+can administer the Spoilies account; it defaults to a profile named `spoilies`.
+
 ## Prior art
 
 [Outwatch](https://github.com/jluszcz/Outwatch) is a Cloudflare Worker tracking which
