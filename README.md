@@ -60,6 +60,31 @@ script rather than by Terraform:
 Idempotent, and safe to re-run to reconcile the bucket's settings. It expects an `AWS_PROFILE` that
 can administer the Spoilies account; it defaults to a profile named `spoilies`.
 
+### Terraform
+
+One flat root module, `spoilies.tf`, applied **from a laptop with an active SSO session, never from
+CI** (§9). CI runs only `fmt` and `validate`, offline, with no AWS credentials configured at all.
+
+```sh
+# Do NOT have $AWS_REGION set when running init
+AWS_PROFILE=spoilies terraform init
+
+# $TF_VAR_alert_email must be set — the budget's notification address is
+# deliberately absent from this repository and has no default. `.envrc` is
+# gitignored and supplies it through direnv.
+AWS_PROFILE=spoilies terraform plan
+AWS_PROFILE=spoilies terraform apply
+
+# Offline — what CI and the pre-commit hook run
+terraform init -backend=false
+terraform fmt -check -recursive -diff
+terraform validate
+```
+
+The AWS provider is pinned to `~> 6.37` and `.terraform.lock.hcl` is committed, so every clone and
+every CI run resolves the same provider build. State lives in `s3://spoilies-tf-state` **in the
+Spoilies account** — not in `jluszcz-tf-state` — with `use_lockfile = true` for S3-native locking.
+
 ## Prior art
 
 [Outwatch](https://github.com/jluszcz/Outwatch) is a Cloudflare Worker tracking which
