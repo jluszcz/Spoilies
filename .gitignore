@@ -1,5 +1,10 @@
 **/*.rs.bk
 **/mutants.out*/
+*.tfstate
+*.tfstate.*
+.terraform.tfstate.lock.info
+.terraform/
 /.claude
+/.envrc
 /.idea
 /target
