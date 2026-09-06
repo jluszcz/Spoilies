@@ -83,7 +83,8 @@ terraform validate
 
 The AWS provider is pinned to `~> 6.37` and `.terraform.lock.hcl` is committed, so every clone and
 every CI run resolves the same provider build. State lives in `s3://spoilies-tf-state` **in the
-Spoilies account** — not in `jluszcz-tf-state` — with `use_lockfile = true` for S3-native locking.
+Spoilies account**, with `use_lockfile = true` for S3-native locking, so separating the account
+carries its state with it.
 
 ## Prior art
 

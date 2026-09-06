@@ -9,10 +9,10 @@ terraform {
     }
   }
 
-  # The bucket is created by scripts/bootstrap-tf-state.sh, not by this
-  # configuration: it holds this configuration's own state. It lives in the
-  # Spoilies account rather than jluszcz-tf-state, so spinning the account out
-  # of the organization never drags a state migration along with it (§9).
+  # The bucket is created by scripts/bootstrap-tf-state.sh: it holds this
+  # configuration's own state, so this configuration cannot create it. It lives
+  # in the Spoilies account, so spinning the account out of the organization
+  # carries its state along with it (§9).
   backend "s3" {
     bucket = "spoilies-tf-state"
     key    = "spoilies"
@@ -62,10 +62,9 @@ data "aws_region" "current" {}
 **************************************/
 
 # The name is not a free choice: github-utils' deploy-lambda.yml computes it as
-# code-${account-id}-${region}-an and uploads there. Unlike the other projects,
-# this is a `resource` rather than a `data` source — the AmazonWebServices repo
-# does not reach into this account, and extending it to would recreate exactly
-# the cross-account state dependency §9 exists to avoid.
+# code-${account-id}-${region}-an and uploads there. Declaring the bucket as a
+# `resource` keeps it owned by this account's own state, which is what keeps the
+# account free of the cross-account state dependency §9 exists to avoid.
 
 resource "aws_s3_bucket" "code" {
   bucket           = format("code-%s-%s-an", data.aws_caller_identity.current.account_id, data.aws_region.current.region)
@@ -142,10 +141,9 @@ resource "aws_s3_bucket_versioning" "code" {
 # §6 pairs this with the reserved concurrency cap as the two controls against
 # denial of wallet, and both are free.
 #
-# A fixed limit rather than the HISTORICAL auto-adjustment the AmazonWebServices
-# repo uses: this account is days old and has no spend history, so a 3-month
-# lookback would adjust to $0 and alarm on the first cent. §1's ceiling is a real
-# number, so it serves directly as the limit.
+# A fixed limit, because §1's ceiling is a real number and serves directly as
+# one. An auto-adjusting limit reads a 3-month lookback, and this account is days
+# old: the lookback would settle at $0 and alarm on the first cent.
 resource "aws_budgets_budget" "monthly" {
   name              = "monthly"
   budget_type       = "COST"
