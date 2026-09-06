@@ -4,4 +4,16 @@ authors = ["Jacob Luszcz"]
 version = "0.1.0"
 edition = "2024"
 
+# github-utils' lambda-package.yml copies target/<triple>/release/lambda to
+# `bootstrap` before zipping, so the binary has to be named `lambda` regardless
+# of which file defines it.
+[[bin]]
+name = "lambda"
+path = "src/main.rs"
+
 [dependencies]
+lambda_http = "1.3"
+serde_json = "1.0"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }

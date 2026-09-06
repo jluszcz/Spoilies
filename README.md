@@ -40,7 +40,10 @@ build, test, `cargo fmt --check`, and `cargo clippy --all-targets -- -D warnings
 service deploys to. To reproduce a CI failure exactly, append `--target
 aarch64-unknown-linux-musl` to the commands above.
 
-There is no packaging or deployment yet; those land with the implementation.
+The Lambda binary is the `lambda` bin target (`src/main.rs`), named that way because
+`github-utils`' `lambda-package.yml` copies `target/<triple>/release/lambda` to `bootstrap` before
+zipping. At S0 it is a diagnostic handler that reports which headers reached the origin; S1a
+replaces it with the axum router.
 
 ## Infrastructure
 
